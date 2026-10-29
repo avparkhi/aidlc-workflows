@@ -1,12 +1,11 @@
 import { DEFAULT_SUBPROCESS_TIMEOUT_MS, LONG_SUBPROCESS_TIMEOUT_MS } from "./aidlc-runtime-budget.ts";
-import { hasStoredMessages } from "./aidlc-message-store.ts";
+import { hasStoredMessages, proveMessage, requestMessageStep, type StoredMessage } from "./aidlc-message-store.ts";
 import { createHash, randomUUID } from "node:crypto";
 import {
   constants as fsConstants,
   copyFileSync,
   cpSync,
   existsSync,
-  linkSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
@@ -35,11 +34,14 @@ import {
 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { QUESTION_UNAVAILABLE, readQuestion, retireRequest, startedRequestFor } from "./aidlc-question-store.ts";
+import { sayWritesBeforePick } from "./aidlc-before-pick.ts";
 import { planApprovalAskState } from "./aidlc-plan-approval-ask.ts";
 import {
   appendAuditEntries,
   appendAuditEntry,
   appendAuditEntryUnlocked,
+  maskSecretShapes,
+  saySecretMaskedOnce,
 } from "./aidlc-audit.ts";
 import {
   applyIntentSettings,
@@ -62,7 +64,7 @@ import {
   keptSettingsNotTheirs,
   levelsKeptForNextWork,
   parseReviewOverride,
-  planApprovalCreationGranted,
+  planApprovalCreationAsked,
   planApprovalMemoryLockRefusal,
   resolvePlanApprovalSetting,
   type ReviewOverride,
@@ -74,6 +76,7 @@ import {
 import { compareVersions, VERSION_ID } from "./aidlc-channel.ts";
 import { main as pluginBuildMain } from "./aidlc-plugin-build.ts";
 import { droppedPluginRegistrations } from "./aidlc-plugin-emit.ts";
+import { main as pluginTestMain } from "./aidlc-plugin-test.ts";
 import { main as pluginValidateMain } from "./aidlc-plugin-validate.ts";
 import {
   ARCHIVED_FROM_FIELD,
@@ -136,6 +139,22 @@ import {
 } from "./aidlc-inline-context.ts";
 import { workspaceManifestChecks } from "./aidlc-workspace-doctor.ts";
 import {
+  hostedAddressOwner,
+  parseWorkspaceManifest,
+  type WorkspaceManifest,
+  workspaceManifestWith,
+  type WorkspaceRepoEntry,
+  withoutCredentials,
+} from "./aidlc-workspace-manifest.ts";
+import {
+  CloneFailure,
+  discardStagedWorkspaceRepo,
+  installWorkspaceRepo,
+  maskUserinfo,
+  type StagedWorkspaceRepo,
+  stageWorkspaceRepo,
+} from "./aidlc-workspace-sync.ts";
+import {
   composedPluginNames,
   copilotCliTrust,
   insideGitRepository,
@@ -192,6 +211,7 @@ import {
   guardFenceFromConfigKey,
   guardPolicyStateField,
   resolveFences,
+  fenceCheckName,
   fenceSourceLabel,
   formatFence,
   noteGuardPolicyRename,
@@ -214,6 +234,7 @@ import {
   parseGuardPolicy,
   parseGuardPolicyStateLine,
   resolveGuardPolicy,
+  composeGateOpen,
   composeMarkerPath,
   COMPOSE_MARKER_TTL_MS,
   defaultScope,
@@ -238,6 +259,8 @@ import {
   getField,
   hasUnsafeSingleLineCharacter,
   holdsAuditLock,
+  acquireAuditLock,
+  releaseAuditLock,
   hooksHealthReadDir,
   readHostHookCall,
   isAutonomousMode,
@@ -248,7 +271,10 @@ import {
   isPluginEnabled,
   isoTimestamp,
   isPackageJson,
+  leaveSayOnceNote,
   isValidRepoName,
+  repoNameProblem,
+  repoNameRefusal,
   aidlcRootIntegrations,
   codekbDir,
   intentsDir,
@@ -259,6 +285,10 @@ import {
   codekbSourceFingerprint,
   codekbStoreGeneration,
   parseReScope,
+  pipelineAttemptStartedAt,
+  pipelineLinkEvidence,
+  issuedStepIsIsolatedRun,
+  singleStageAttemptIsOpen,
   relativeCodekbDir,
   RESERVED_RECORD_NAMES,
   scopePathCovered,
@@ -297,6 +327,7 @@ import {
   needsFlatMigration,
   nextInScopeStage,
   answerModeStageStartedFields,
+  scopeGridOnProject,
   stageReopenedByScopeChange,
   PHASES,
   parseArgs,
@@ -313,9 +344,16 @@ import {
   type PlanChanges,
   plannedStages,
   cursorPastStage,
+  addedStagesPassedOver,
+  addReachesPassedOver,
+  stageAddedBack,
+  stageSkippedWhereItStood,
+  constructionHasStarted,
+  reverseEngineeringOwedBehindCursor,
   planWithChanges,
   composedPlanLabel,
   PLAN_NAME_PATTERN,
+  savedScopeNameRefusal,
   splitSlugList,
   readAllAuditShards,
   readAuditShardEvents,
@@ -340,6 +378,7 @@ import {
   resolveAuditWorktreePath,
   resolveBoltIdentity,
   readProjectDescriptionAuthority,
+  singleRunRequest,
   repoDir,
   registerIntentRecord,
   leaveCreationReceipt,
@@ -353,6 +392,12 @@ import {
   resolveIntentRepoSet,
   MANY_REPOS,
   isGitRepoDir,
+  clearUnitsReposAsked,
+  governedGuardPolicy,
+  recordAcceptedChanges,
+  repoBaselineAdditionField,
+  unitsRepoChange,
+  unitsRepoChangeAcceptance,
   resolveProjectDir,
   setActiveIntentCursor,
   setActiveSpaceCursor,
@@ -425,6 +470,7 @@ import {
   fillHookActivationText,
   hookActivation,
   hookExecutionRecoveryText,
+  startedInsideProjectStep,
   projectSettingsRepair,
   heartbeatAt,
   type HookLiveness,
@@ -447,8 +493,11 @@ import {
   OWN_TERMINAL_PRESENCE_STEP,
   personAtOwnTerminal,
   personAskedForThisLowering,
-  personSpokeSinceGate,
+  turnsPersonsCheckOff,
+  turnsPlanApprovalOff,
+  personAskedSinceGate,
   personSaidProjectType,
+  CONDUCTOR_SUMMARY_FIELD,
   clearProjectTypeAsked,
   readAnswerTextFile,
   recordDir,
@@ -460,6 +509,9 @@ import {
   isScopedReviewCopy,
   KIRO_CONDUCTOR_AGENT_FILE,
   PERSON_ASKED_SKIP_REASON,
+  personsWordsText,
+  declaredProjectType,
+  installWithoutReplacing,
 } from "./aidlc-lib.ts";
 import { GUARD_POLICY_GLOSS, SCOPE_GLOSS } from "./aidlc-guard-fences.ts";
 import { validateStageFrontmatter } from "./aidlc-stage-schema.ts";
@@ -490,8 +542,8 @@ import {
   tomlFragmentText,
   withFileLineEndings,
 } from "./aidlc-plugin.ts";
-import { resolveHookPath } from "./aidlc.ts";
-import { executePlan } from "./aidlc-transaction.ts";
+import { pluginTestCommand, renderPluginTestHelp, resolveHookPath } from "./aidlc.ts";
+import { executePlan, withTransactionFix } from "./aidlc-transaction.ts";
 import {
   aidlcDispatcherInvocation,
   aidlcInvocation,
@@ -500,6 +552,7 @@ import {
   discoverProjectHarnesses,
   isCompiledExecutable,
   type ProjectHarness,
+  pinNamedHarness,
   quoteCommandArgument,
   resolveHarnessPath,
   resolveSkillsPath,
@@ -575,10 +628,17 @@ function validateIntentSettingsArgs(
 ): void {
   const allowed = new Set<string>([...CONFIG_KEYS, ...Object.keys(RETIRED_CONFIG_KEYS), "intent", "space", "project-dir"]);
   if (command === "scope-change") allowed.add("scope");
-  // The person's own words the agent says asked for this: the setter proves them
-  // against their replies before it records the setting as theirs.
+  // The skips typed beside a switch that land before it reopens finished work.
+  if (command === "scope-change") allowed.add("skip");
+  // The message the person asked in (--message), which the setter proves before
+  // it records the setting as theirs; the words form from before it is taken as
+  // the agent's own text.
+  allowed.add("message");
   allowed.add("person-words");
   allowed.add("person-words-file");
+  // Takes no value: an engine step that prints the setter's output as it is.
+  const bare = command === "config-change" ? "verbatim" : null;
+  if (bare !== null) allowed.add(bare);
   // Inspect option names before the parser's object assignment as well, so
   // even an unknown property-like name cannot disappear from validation.
   for (const arg of rawArgs) {
@@ -589,6 +649,10 @@ function validateIntentSettingsArgs(
     if (!allowed.has(name)) die(`${command} does not accept --${name}.`);
   }
   for (const name of allowed) {
+    if (name === bare) {
+      if (!missingValueFlags.has(name) && flags[name] !== undefined) die(`${command} --${name} takes no value.`);
+      continue;
+    }
     if (missingValueFlags.has(name) || (flags[name] !== undefined && flags[name].trim().length === 0)) {
       die(`${command} --${name} requires a nonblank value.`);
     }
@@ -623,6 +687,8 @@ const INTENT_CREATE_VALUE_FLAGS = [
   "skip",
   "add",
   "plan-name",
+  "save-as",
+  "message",
   "person-words",
   "person-words-file",
   "repos",
@@ -742,6 +808,21 @@ function appendAuditEvent(
   }
 }
 
+// Doctor's own receipt rows (DOCTOR_RUN_AUDIT_EVENTS) are not work: a busy lock
+// skips the row after the tight bound the guard rows use, instead of holding
+// doctor for the whole acquire budget. A lock that never frees has its own
+// leaked-lock row in the report. A write failure still throws. The caller
+// passes the append itself, so each row's event stays at its call site, where
+// t48 looks for it.
+function appendDoctorReceipt(projectDir: string, append: () => void): void {
+  if (!acquireAuditLock(projectDir, 5, 50)) return;
+  try {
+    append();
+  } finally {
+    releaseAuditLock(projectDir);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // help
 // ---------------------------------------------------------------------------
@@ -774,14 +855,14 @@ Utilities:
   unit status       Show claimable, claimed, and dependency-blocked Units
   compose "<task>"  Suggest a plan tailored to this task (mid-workflow: adjust the steps not yet run)
   compose --report <path>  Build a plan from a scan report (sort findings into a fix-and-ship run)
-  --new-scope "<task>"  Build a custom plan even when a ready-made one matches
+  --new-scope '<task>'  Build a custom plan even when a ready-made one matches
   intent list       List intents in the active space (read-only; --json for structured output; --all includes archived)
   intent switch <name>  Switch the active intent (bare intent <name> still works)
   intent archive <name> [--reason <text>]  Retire an in-flight or completed intent; its record stays on disk and leaves the default list
   intent unarchive <name>  Bring an archived intent back as it was (in-flight or complete)
-  intent add-repo <name>  Add a sibling repo to the active piece of work (until Units Generation is approved)
-  intent remove-repo <name>  Take a sibling repo out of the active piece of work (never the last one)
-  intent set-repos <name,...> | --all  Set exactly which sibling repos the active piece of work covers, or keep them all (until Units Generation is approved)
+  intent add-repo <name> [--url <address>] [--reason <text>] [--person-words <their words>]  Add a sibling repo to the active piece of work, cloning it first when it is not here yet (from repos.json, or --url)
+  intent remove-repo <name>  Take a sibling repo out of the active piece of work (never the last one); its folder and its repos.json line stay
+  intent set-repos <name,...> | --all  Set exactly which sibling repos the active piece of work covers, or keep them all
   intent add-checkout <path>  Record a checkout outside the review's reach (a harness-folder worktree, or one outside the project) so the review covers the code there
   intent remove-checkout <path>  Take a recorded checkout out of the active piece of work's review
   space list        List spaces (read-only; --json for structured output)
@@ -1426,7 +1507,7 @@ function handleSelectPlugins(projectDir: string, positional: string[]): void {
       }
     } catch (err) {
       resetSelectionSensitiveCaches();
-      die(`select-plugins failed: ${errorMessage(err)}`);
+      die(`select-plugins failed: ${withTransactionFix(err, errorMessage(err))}`);
     } finally {
       rmSync(stagingRoot, { recursive: true, force: true });
     }
@@ -1537,6 +1618,44 @@ function handlePluginBuild(
   pluginAuthorCommandCode(pluginBuildMain(args));
 }
 
+function handlePluginTest(
+  positional: string[],
+  flags: Record<string, string>,
+  missingValueFlags: ReadonlySet<string>,
+): void {
+  const { usage, options } = pluginTestCommand();
+  // Help wherever it is asked, as the standalone tool reads it.
+  if (flags.help !== undefined || positional.slice(1).includes("-h")) {
+    process.stdout.write(renderPluginTestHelp());
+    return;
+  }
+  const takesValue = new Map(
+    options.map((option) => [option.flag.slice(2), option.metavar !== undefined]),
+  );
+  const paths = positional.slice(1);
+  let reason: string | null = null;
+  for (const [name, value] of Object.entries(flags)) {
+    const valued = takesValue.get(name);
+    if (valued === undefined) reason ??= `unknown option "--${name}"`;
+    else if (valued && missingValueFlags.has(name)) reason ??= `--${name} requires a value`;
+    // The shared parser hands a bare option the word after it; that word is
+    // the plugin's folder.
+    else if (!valued && value !== "true") paths.push(value);
+  }
+  if (paths.length > 1) reason ??= `unexpected positional argument "${paths[1]}"`;
+  if (reason !== null) {
+    process.stderr.write(`Usage: ${usage}\n${reason}\n`);
+    process.exitCode = 2;
+    return;
+  }
+  const args = [paths[0] ?? process.cwd()];
+  if (flags.install !== undefined) args.push("--install", flags.install);
+  if (flags.harness !== undefined) args.push("--harness", flags.harness);
+  if (flags.with !== undefined) args.push("--with", flags.with);
+  if (flags.json !== undefined) args.push("--json");
+  pluginAuthorCommandCode(pluginTestMain(args, `Usage: ${usage}`));
+}
+
 // The sync doctor names for these plugins: where the host lists its plugins,
 // the chat command or the engine's with the root set; elsewhere one command
 // per plugin, with its folder.
@@ -1629,7 +1748,7 @@ async function handlePluginSync(projectDir: string, pluginRoot: string | undefin
         }
         await mod.compose();
       } catch (error) {
-        die(`plugin-sync failed for ${item.root}: ${errorMessage(error)}`);
+        die(`plugin-sync failed for ${item.root}: ${withTransactionFix(error, errorMessage(error))}`);
       } finally {
         for (const key of envKeys) {
           const value = previous[key];
@@ -1898,13 +2017,11 @@ To get started:
     });
     guardPolicyDisplay = formatGuardPolicy(resolution.value, shownSource(resolution.source));
     const fences = resolveFences(resolution, content);
-    // The plan-approval fence now only decides whether an approved plan that is
-    // edited asks again; the Plan Approval line below is the plan stop itself.
     const offBySource = new Map<string, string[]>();
     for (const fence of GUARD_FENCES) {
       if (fences[fence].value !== "off" || fences[fence].source.startsWith("guard policy ")) continue;
       const source = fenceSourceLabel(fences[fence]);
-      offBySource.set(source, [...(offBySource.get(source) ?? []), fence === "plan-approval" ? "plan re-approval" : fence]);
+      offBySource.set(source, [...(offBySource.get(source) ?? []), fenceCheckName(fence)]);
     }
     if (offBySource.size > 0) {
       fencesOffLine = `Checks off:     ${[...offBySource].map(([source, names]) => `${names.join(", ")} (${source})`).join("; ")}\n`;
@@ -1954,11 +2071,11 @@ To get started:
   // or the engine's own) stands where the cursor stands, whatever the checkbox
   // says, so it is read first; a park the work has since moved past is stale
   // and holds nothing, the same rule the router uses (parkedWhereItStands in
-  // aidlc-orchestrate.ts). The line carries the way back, in the harness's own
+  // aidlc-testing-posture.ts). The line carries the way back, in the harness's own
   // entry word. A live run read "Status: Running" over paused work and the
   // agent had to correct it.
-  // Read for the selected work only, as the step marker below is.
-  const planAsk = flags.intent || flags.space ? null : openPlanApprovalAsk(projectDir);
+  // Read for the work this status is for, the one named or the selected one.
+  const planAsk = openPlanApprovalAsk(projectDir, flags.intent, flags.space);
   const parkedAt = (getField(content, "Parked At Stage") ?? "").trim();
   const parked = (getField(content, "Parked") ?? "").trim().length > 0 &&
     parkedAt.length > 0 && parkedAt === currentStage &&
@@ -1982,7 +2099,7 @@ To get started:
     const plans = units.length > 1
       ? `code plans for ${units.join(", ")}`
       : `code plan${units.length === 1 ? ` for ${units[0]}` : ""}`;
-    statusLine = planApprovalAskState(projectDir) === "editing"
+    statusLine = planApprovalAskState(projectDir, planAsk.intent_uuid ?? "bare-space") === "editing"
       ? `Waiting for you to finish editing the ${plans}`
       : `Awaiting your approval on the ${plans}`;
   } else if (currentCheckbox?.state === "awaiting-approval") {
@@ -2037,7 +2154,8 @@ To get started:
   // is. Initialization's setup, done when the work was created, keeps its row
   // below and stays out of the count.
   const checkboxes = parseCheckboxes(content);
-  const planned = new Set(plannedStages(content, scope).map((s) => s.slug));
+  const work = selection.intent === null ? null : { projectDir, intent: selection.intent, space: selection.space };
+  const planned = new Set(plannedStages(content, scope, work).map((s) => s.slug));
   const setup = new Set(graph.filter((s) => s.phase === "initialization").map((s) => s.slug));
   const scopedCheckboxes = checkboxes.filter((c) =>
     planned.has(c.slug) ||
@@ -3038,12 +3156,13 @@ function projectedFileRepair(
   return `restore ${relativePath} from git, or re-copy \`dist/${distribution}/${relativePath}\` from the aidlc-workflows checkout`;
 }
 
-// Issue #1146: Kiro IDE compiles each ignore file into its own matcher. Checking
-// the project with git would let a repo negation mask a global deny; doctor's
-// subprocess reads are not IDE fs_read calls, so evaluate each source alone.
+// Issue #1146: Kiro (the IDE and Kiro CLI v3) compiles each ignore file into its
+// own matcher. Checking the project with git would let a repo negation mask a
+// global deny; doctor's subprocess reads are not Kiro fs_read calls, so evaluate
+// each source alone.
 // Doctor output reaches the model verbatim, so rows name each source by a fixed
 // identifier and never echo a path, a pattern, or git's own diagnostics.
-const KIRO_IGNORE_PREFIX = "Kiro IDE ignore sources:";
+const KIRO_IGNORE_PREFIX = "Kiro ignore sources:";
 const GLOBAL_EXCLUDES_ID = "git's global excludes file";
 
 type IgnoreSource = { id: string; file: string; workspace: boolean };
@@ -3135,8 +3254,9 @@ function gitRepositoryOnDisk(
   return { onDisk: false, linkedGitDir: false };
 }
 
-// The ignore files Kiro IDE honours, each on its own. Kiro applies git's global
-// excludes only in a git repository; git's own yes to that wins. Git exits 128
+// The ignore files Kiro honours, each on its own (Kiro CLI v3 skips .gitignore,
+// which only Kiro IDE's kiroAgent.agentIgnoreFiles turns on). Kiro applies git's
+// global excludes only in a git repository; git's own yes to that wins. Git exits 128
 // both outside a repository and when it refuses one (dubious ownership, for
 // example), so a failed probe means "not a repository" only when nothing is on
 // disk either; otherwise the global file cannot be ruled out and is skipped.
@@ -3256,15 +3376,15 @@ function defaultGlobalExcludesId(env: NodeJS.ProcessEnv): string {
   return env.XDG_CONFIG_HOME ? "$XDG_CONFIG_HOME/git/ignore" : "~/.config/git/ignore";
 }
 
-// The files Kiro IDE's agent reads through fs_read, from the roster the engine
+// The files the Kiro conductor reads through fs_read, from the roster the engine
 // hands it: for every stage harness.json selects in the compiled graph, the stage
 // file and the persona and knowledge the conductor holds inline (the shared
 // inline-context roster at Standard and Minimal depth, each under the directive's
 // byte cap), plus stage-protocol.md and its stage-protocol-<name>.md modules
 // (contributor-only protocol files such as stage-definition.md are not loaded)
 // and the files the skills name beside SKILL.md. SKILL.md files, the
-// IDE conductor agent (agents/aidlc-aidlc.md), and aidlc-common/conductor.md are loaded
-// by the IDE or the engine, not through fs_read. Without a readable graph, every
+// conductor agent (agents/aidlc-aidlc.md), and aidlc-common/conductor.md are loaded
+// by Kiro itself or the engine, not through fs_read. Without a readable graph, every
 // stage file, persona, and knowledge file stands in for the stage roster; without
 // an installed tree, one read of each kind does.
 function kiroIdeFrameworkReads(projectDir: string, harness: string): string[] {
@@ -3420,13 +3540,18 @@ function hiddenReadRows(
       const what = all ? `${harness}/` : `${hidden.length} of ${probes.length} framework files (${named.join(", ")})`;
       const denies = all ? "every stage, agent, and protocol read" : "those framework reads";
       const locate = id === "core.excludesFile" ? ` (${lookup} prints its path)` : "";
+      // Kiro CLI v3 applies .kiroignore with no setting and never .gitignore;
+      // Kiro IDE applies either only when kiroAgent.agentIgnoreFiles names it.
+      const applies = id === ".kiroignore"
+        ? "Kiro CLI v3 applies .kiroignore; Kiro IDE applies it when kiroAgent.agentIgnoreFiles names it"
+        : "applies when Kiro IDE's kiroAgent.agentIgnoreFiles names .gitignore, as the default does; Kiro CLI v3 does not apply it";
       rows.push({
         pass: false,
         severity: workspace ? "warn" : undefined,
         label: workspace
-          ? `${KIRO_IGNORE_PREFIX} ${at} hides ${what} (advisory - applies when Kiro IDE's kiroAgent.agentIgnoreFiles names ${id}; the default includes .gitignore)`
-          : `${KIRO_IGNORE_PREFIX} ${at} hides ${what} - the IDE's fs_read guard denies ${denies}`,
-        fix: `remove or narrow the ${lines.size > 1 ? "rules" : "rule"} at ${at}${locate}; Kiro IDE evaluates each ignore file on its own, so a "!${harness}/" in another file and a permissions.yaml fs_read allow do not override it (Kiro applies deny-overrides across scopes); keep per-repo ignores in that repo's .git/info/exclude, which git honours and Kiro does not list as an ignore source; then run doctor again`,
+          ? `${KIRO_IGNORE_PREFIX} ${at} hides ${what} (advisory - ${applies})`
+          : `${KIRO_IGNORE_PREFIX} ${at} hides ${what} - Kiro's fs_read guard (Kiro IDE and Kiro CLI v3) denies ${denies}`,
+        fix: `remove or narrow the ${lines.size > 1 ? "rules" : "rule"} at ${at}${locate}; Kiro evaluates each ignore file on its own, so a "!${harness}/" in another file and a permissions.yaml fs_read allow do not override it (Kiro applies deny-overrides across scopes); keep per-repo ignores in that repo's .git/info/exclude, which git honours and Kiro does not list as an ignore source; then run doctor again`,
       });
     }
   } catch {
@@ -4508,7 +4633,7 @@ export async function collectDoctorReport(
         label:
           hooksDisabledBy === null
             ? "Hooks enabled (resolved disableAllHooks is not true)"
-            : `Hooks DISABLED via "disableAllHooks": true in ${hooksDisabledBy} — AI-DLC cannot run (audit, state sync, sensors, and stage-graph rebuild are all silently skipped even though the hook files are present)`,
+            : `Hooks DISABLED via "disableAllHooks": true in ${hooksDisabledBy} - AI-DLC cannot run (audit, state sync, sensors, and stage-graph rebuild are all silently skipped even though the hook files are present)`,
         fix:
           hooksDisabledBy === null
             ? undefined
@@ -4597,7 +4722,7 @@ export async function collectDoctorReport(
 
   // 4. Harness wiring config present. Claude Code: settings.json (hooks +
   // permissions live there). Kiro CLI: agents/aidlc.json plus
-  // settings/cli.json; Kiro IDE: agents/aidlc-aidlc.md. Codex CLI: config.toml +
+  // settings/cli.json; Kiro IDE and Kiro CLI v3: agents/aidlc-aidlc.md. Codex CLI: config.toml +
   // hooks.json (the hook wiring) + rules/default.rules (permissions).
   if (harness === ".kiro") {
     const jsonAgentPath = join(projectDir, harness, "agents", "aidlc.json");
@@ -4606,7 +4731,7 @@ export async function collectDoctorReport(
     results.push({
       pass: hasJsonAgent || existsSync(markdownAgentPath) || existsSync(join(projectDir, harness, "agents", "aidlc.md")),
       label: "agents/aidlc.json or agents/aidlc-aidlc.md present (conductor wiring)",
-      fix: `${projectedFileRepair("kiro", ".kiro/agents/aidlc.json")} (Kiro CLI) or ${projectedFileRepair("kiro-ide", ".kiro/agents/aidlc-aidlc.md")} (Kiro IDE)`,
+      fix: `${projectedFileRepair("kiro", ".kiro/agents/aidlc.json")} (Kiro CLI) or ${projectedFileRepair("kiro-ide", ".kiro/agents/aidlc-aidlc.md")} (Kiro IDE and Kiro CLI v3)`,
     });
     results.push(...kiroDisabledHookChecks(projectDir, harness));
     if (hasJsonAgent) {
@@ -5218,7 +5343,9 @@ export async function collectDoctorReport(
   const workflowStageStarted = auditAllShards.includes("**Event**: STAGE_STARTED");
   const hookExecutionRecovery = gitBashLauncherRecovery() ?? hookExecutionRecoveryText(projectDir);
   const declaredNotRunYet = hookActivation()?.notRunYet;
-  const hooksNotRunYet = declaredNotRunYet === undefined ? undefined : fillHookActivationText(declaredNotRunYet, projectDir);
+  const hooksNotRunYet = declaredNotRunYet === undefined
+    ? undefined
+    : startedInsideProjectStep(projectDir) ?? fillHookActivationText(declaredNotRunYet, projectDir);
 
   // 6. Hook heartbeats
   // Three states, discriminated by health-dir presence, readable heartbeats,
@@ -5560,9 +5687,9 @@ export async function collectDoctorReport(
   }
 
   // Leaked-lock probe (P3 reaper surface). Doctor automatically clears only a
-  // provably-dead valid owner or an old genuinely-missing stamp. Live,
-  // malformed, and unreadable owners fail closed and require quiescent manual
-  // recovery.
+  // provably-dead valid owner or an old stamp that never finished. Live
+  // owners, stamps that name no valid owner, and unreadable ones fail closed and
+  // require quiescent manual recovery.
   try {
     const leaks = detectLeakedLocks(projectDir, true);
     if (leaks.length === 0) {
@@ -5574,13 +5701,12 @@ export async function collectDoctorReport(
           : leak.kind === "coordination-gate" ? "lock coordination gate"
           : "legacy active-directive transaction";
         const outcome = leak.cleared ? "cleared" : "not cleared";
-        const manual = !leak.cleared;
-        results.push({
+        const label = `Leaked ${subject} on bucket "${leak.bucket}" (${leak.reason}${leak.ownerPid !== null ? `, pid ${leak.ownerPid}` : ""}) - ${outcome}`;
+        // A lock doctor cleared is fixed: its row passes and says so.
+        results.push(leak.cleared ? { pass: true, label } : {
           pass: false,
-          label: `Leaked ${subject} on bucket "${leak.bucket}" (${leak.reason}${leak.ownerPid !== null ? `, pid ${leak.ownerPid}` : ""}) - ${outcome}`,
-          fix: manual
-            ? `stop all AI-DLC processes, inspect ${leak.lockDir}, then remove or restore it under quiescence`
-            : `the stale lock was cleared automatically; re-run your ${entrySkillInvocation()} command`,
+          label,
+          fix: `stop all AI-DLC processes, inspect ${leak.lockDir}, then remove or restore it under quiescence`,
         });
       }
     }
@@ -6101,7 +6227,7 @@ export async function collectDoctorReport(
           `${cleanupOrphans.length} cleanup-orphan${cleanupOrphans.length === 1 ? "" : "s"} (merge/discard landed, dir persists): ${cleanupOrphans.join(", ")}`,
         );
       }
-      label = `Orphan worktrees: ${orphanActive.length + cleanupOrphans.length} drift — ${[...orphanActive, ...cleanupOrphans].join(", ")}`;
+      label = `Orphan worktrees: ${orphanActive.length + cleanupOrphans.length} drift - ${[...orphanActive, ...cleanupOrphans].join(", ")}`;
       fix = `${parts.join("; ")}. Inspect the owning intent, then remove via 'aidlc-worktree discard --slug <slug> --intent <record> --space <space>'.`;
     }
     results.push({ pass, label, fix });
@@ -6168,7 +6294,7 @@ export async function collectDoctorReport(
       } else {
         results.push({
           pass: false,
-          label: `Stale branches: ${stale.length} drift — ${stale.join(", ")}`,
+          label: `Stale branches: ${stale.length} drift - ${stale.join(", ")}`,
           fix: "Inspect unrecognised names and unknown intent ownership. Recognised branches have no worktree directory and no owning WORKTREE_MERGED/_DISCARDED audit row. Delete via 'git branch -D <full-bolt-name>' only if abandoned.",
         });
       }
@@ -6236,7 +6362,7 @@ export async function collectDoctorReport(
     } else {
       results.push({
         pass: false,
-        label: `Orphan state files: ${orphan.length} drift — ${orphan.join(", ")}`,
+        label: `Orphan state files: ${orphan.length} drift - ${orphan.join(", ")}`,
         fix: "Inspect unrecognised names and unknown intent ownership. Recognised state files have no owning Bolt Refs entry or WORKTREE_DISCARDED row. Recover via 'aidlc-worktree discard --slug <slug> --intent <record> --space <space>' (idempotent).",
       });
     }
@@ -6975,9 +7101,9 @@ export async function collectDoctorReport(
   // self-creates the audit shard/dir, so an unconditional emit on a pristine
   // project would create a record as a side effect, making --doctor NOT
   // read-only. Doctor runs on a fresh checkout before any workflow is created, so
-  // it must create nothing. On a project with a created intent the emit fires
-  // exactly as before (BARE appendAuditEvent — the only throw is a real write
-  // failure, which the rest of the codebase lets propagate).
+  // it must create nothing. On a project with a created intent the emit goes
+  // through appendDoctorReceipt (a busy lock skips it; a real write failure
+  // still propagates).
   let pairedRuleCount: number | null = null;
   try {
     const pairedRules = loadRules();
@@ -7122,11 +7248,11 @@ export async function collectDoctorReport(
   const auditExists = auditShards(projectDir).length > 0;
 
   if (auditExists && pairedRuleCount !== null) {
-    appendAuditEvent(projectDir, "GUARDRAIL_LOADED", {
+    appendDoctorReceipt(projectDir, () => appendAuditEntryUnlocked("GUARDRAIL_LOADED", {
       Scope: "all",
       Path: `${harnessDir()}/${rulesSubdir()}/`,
       "Rule count": String(pairedRuleCount),
-    });
+    }, projectDir));
   }
 
   let passed = 0;
@@ -7146,10 +7272,10 @@ export async function collectDoctorReport(
   // see auditExists above). A pristine project gets the stdout report and no
   // file side effects; an initialized project records HEALTH_CHECKED as before.
   if (auditExists) {
-    appendAuditEvent(projectDir, "HEALTH_CHECKED", {
+    appendDoctorReceipt(projectDir, () => appendAuditEntryUnlocked("HEALTH_CHECKED", {
       Request: `/aidlc --doctor`,
       Details: `${passed} passed, ${failed} failed`,
-    });
+    }, projectDir));
   }
 
   return { checks: reportResults, passed, warnings, failed, parked_attempts: parkedAttempts };
@@ -7201,12 +7327,7 @@ export const PROJECT_TYPE_SOURCE_FIELD = "Project Type Source";
 export const PROJECT_TYPE_SOURCE_SCAN = "workspace scan";
 export const PROJECT_TYPE_SOURCE_PERSON = "you";
 
-export function declaredProjectType(value: string | undefined): "Greenfield" | "Brownfield" | null {
-  const word = value?.trim().toLowerCase();
-  if (word === "greenfield") return "Greenfield";
-  if (word === "brownfield") return "Brownfield";
-  return null;
-}
+export { declaredProjectType };
 
 // The Stages to Skip entry that marks Reverse Engineering as skipped only
 // because the work is a new project (scope-save keeps the stage for that reason).
@@ -7776,10 +7897,11 @@ function phasesWithExecuteStages(plan: Record<string, "EXECUTE" | "SKIP">): Set<
 //
 // Scope-excluded phases get NO folder: an empty `operation/` in a bugfix record
 // reads as work that was planned and skipped, when that phase was never in the
-// plan. Nothing depends on the folder pre-existing: a stage artifact is written
-// by the agent's own file tool, which creates its parent chain on first write,
-// and every deterministic reader of a phase dir guards on existence. This only
-// ever creates: an older record that already carries all five keeps them.
+// plan. Nothing depends on the folder pre-existing: `next` makes each stage's
+// folder when it hands out the step that writes there (prepareRecordFolders in
+// aidlc-orchestrate.ts), and every deterministic reader of a phase dir guards
+// on existence. This only ever creates: an older record that already
+// carries all five keeps them.
 function ensureWorkspaceDirs(
   projectDir: string,
   plan: Record<string, "EXECUTE" | "SKIP">,
@@ -7907,7 +8029,9 @@ function answerAlreadyStarted(projectDir: string, questionId: string, sessionId?
 // the CREATED intent's record (the active-intent cursor set first makes the
 // default-resolving state/audit helpers resolve there).
 function handleIntentCreate(projectDir: string, flags: Record<string, string>): void {
-  readPersonWordsFile(projectDir, flags);
+  // New work's settings are its own, carried with the request that starts it,
+  // so a decision on the work in hand does not spend them.
+  const named = setterMessage(projectDir, flags, false, { newWork: true, request: true });
   // An engine question's answer names its request by id. The copy is removed
   // once the answer starts work, so look for that work before the copy.
   const questionId = flags.request;
@@ -7941,7 +8065,7 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
         `intent. Start work via \`${entrySkillInvocation()} "<what to build>"\` (the engine names ` +
         "the create move for you); " +
         "to invoke this tool directly, pass at least `--scope <name>` (and " +
-        "ideally `--arguments \"<description>\" --label \"<2-3 word essence>\"`).",
+        "ideally `--arguments '<description>' --label '<2-3 word essence>'`).",
     );
   }
 
@@ -8002,6 +8126,14 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
   const planName = flags["plan-name"];
   if (planName !== undefined && !PLAN_NAME_PATTERN.test(planName)) {
     die(`--plan-name takes lowercase letters, digits and hyphens; received "${planName}".`);
+  }
+  // Approve and save as scope: the plan is saved once the work is created, so
+  // a name the save would refuse creates nothing and is asked for again.
+  const saveAs = flags["save-as"];
+  if (saveAs !== undefined) {
+    const refusal = savedScopeNameRefusal(saveAs);
+    if (refusal !== null) die(refusal);
+    if (scopeNameTaken(saveAs)) die(`A scope named ${saveAs} already exists. Pick another name.`);
   }
   const plannedStages = planWithChanges(scope, planChanges);
   if (plannedStages.errors.length > 0) {
@@ -8069,8 +8201,7 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
   // When the person asked for it off in this chat before the work existed (the
   // compose gate, the scope confirmation), the human-turn hook recorded their
   // words, and this piece of work starts with it off, set by them.
-  const planApprovalAsked = planApprovalCreationGranted(projectDir, initialSelection.sessionId, questionId ?? null) &&
-    process.env.AIDLC_UNATTENDED !== "1";
+  const planApprovalAsked = planApprovalCreationAsked(projectDir, initialSelection.sessionId, questionId ?? null);
   // The words cover the next piece of work this chat creates, and no later one:
   // a rejected plan, another request, or a failed attempt leaves nothing behind.
   consumePlanApprovalCreationGrant(projectDir, initialSelection.sessionId);
@@ -8086,12 +8217,12 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
   consumeCeremoniesCreationGrant(projectDir, initialSelection.sessionId);
   // Whose a setting this creation carries reads as: the one rule the setter
   // uses (settingTheirs), on their own terminal, their own typed line or the
-  // reply of theirs the agent names; a creation that names no request takes
-  // nobody's line, only their named reply.
+  // message of theirs the agent names; a creation that names no request takes
+  // nobody's line, only their named message.
   const theirsAtCreation = (key: string, value: string): boolean =>
     commandAtPersonsTerminal() ||
     settingTheirs(
-      projectDir, initialSelection.sessionId, key, questionId !== undefined ? value : undefined, flags["person-words"],
+      projectDir, initialSelection.sessionId, key, questionId !== undefined ? value : undefined, named.message,
     ) !== null;
   for (const key of CEREMONY_KEYS) {
     if (key === "plan_approval") continue;
@@ -8120,13 +8251,15 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
   // who typed `--plan-approval off` with the work they are describing gets it on
   // the work they pick instead of a refusal telling the agent to create the work
   // and run the setter afterwards.
-  // Their own words, or their own terminal: either makes the lowering theirs, so
-  // the work records it as set by them (personAskedForThisLowering).
-  // A recorded presence bypass authorizes the lowering, as it does on main, but
-  // it is nobody's word: the setting stays "set by a command".
-  const loweringAuthorized = (): boolean =>
-    personAskedForThisLowering(projectDir, initialSelection.sessionId) ||
-    fenceKeyBypassed(projectDir, initialSelection.sessionId);
+  // The message they asked in, their own terminal, or their own typed line for
+  // these settings: each makes the lowering theirs, so the work records it as
+  // set by them (personAskedForThisLowering, theirsAtCreation). A recorded
+  // presence bypass authorizes the lowering, as it does on main, but it is
+  // nobody's word: the setting stays "set by a command".
+  const loweringAuthorized = (lowered: ReadonlyArray<[string, string]>): boolean =>
+    personAskedForThisLowering(named.message) ||
+    fenceKeyBypassed(projectDir, initialSelection.sessionId) ||
+    (lowered.length > 0 && lowered.every(([key, value]) => theirsAtCreation(key, value)));
   // A check typed off is the person's call too, under the same rule. A team's
   // strict Guard Policy keeps it on, as it keeps a check granted before the
   // work existed (fencesAsked above): the work is created with the check on,
@@ -8136,7 +8269,9 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
   if (fencesTypedOff.length > 0 && teamKeptCheck === null) {
     const wanted: GuardSwitch = { key: `guard.${fencesTypedOff[0]}`, value: "off" };
     if (process.env.AIDLC_UNATTENDED === "1") die(guardSwitchRefusal(wanted));
-    if (!loweringAuthorized()) die(guardSwitchRefusal(wanted, projectDir));
+    if (!loweringAuthorized(fencesTypedOff.map((fence) => [`guard.${fence}`, "off"]))) {
+      die(guardSwitchRefusal(wanted, projectDir));
+    }
     for (const fence of fencesTypedOff) if (!fencesAsked.includes(fence)) fencesAsked.push(fence);
   }
   if (requestedCeremony.plan_approval === "off") {
@@ -8145,8 +8280,9 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
       const wanted: GuardSwitch = { key: "plan-approval", value: "off" };
       // An unattended driver never lowers a check, whoever asked.
       if (process.env.AIDLC_UNATTENDED === "1") die(guardSwitchRefusal(wanted));
-      if (!loweringAuthorized()) die(guardSwitchRefusal(wanted, projectDir));
-      if (theirsAtCreation("plan-approval", "off") || theirsAtCreation("guard.plan-approval", "off")) {
+      const typedOff = theirsAtCreation("plan-approval", "off") || theirsAtCreation("guard.plan-approval", "off");
+      if (!typedOff && !loweringAuthorized([])) die(guardSwitchRefusal(wanted, projectDir));
+      if (typedOff) {
         ceremonySetByPerson.plan_approval = true;
       }
     }
@@ -8159,7 +8295,7 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
     const wanted: GuardSwitch = { key: "guard-policy", value: requestedChangeControl };
     // An unattended driver never lowers fences, including a recorded presence bypass.
     if (process.env.AIDLC_UNATTENDED === "1") die(guardSwitchRefusal(wanted));
-    if (!loweringAuthorized()) die(guardSwitchRefusal(wanted, projectDir));
+    if (!loweringAuthorized([["guard-policy", requestedChangeControl]])) die(guardSwitchRefusal(wanted, projectDir));
   }
   // Theirs on record (their line, their terminal, or kept as theirs), or the command's.
   if (requestedChangeControl !== null && !guardPolicySetByPerson) {
@@ -8193,6 +8329,9 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
     die(errorMessage(e));
   }
 
+  // The record this run created and listed; an earlier return (a migration, a
+  // start already made) saves nothing.
+  let listed = null as { dirName: string; space: string } | null;
   // The whole mutation runs under the WORKSPACE lock so a concurrent first-run
   // is serialized - both creation attempts append distinct rows to intents.json without a
   // lost update. The migration probe + the registry append are the reads/writes
@@ -8509,11 +8648,24 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
     if (teamKeptCheck !== null && initialSelection.sessionId) {
       addPendingPersonLines(projectDir, initialSelection.sessionId, [teamKeptCheck]);
     }
+    // The person's files the agent changed before this pick, said once with the way back.
+    if (questionId !== undefined) {
+      try {
+        sayWritesBeforePick(projectDir, questionId, created, initialSelection.sessionId);
+      } catch {
+        // Unsaid: the work starts as picked.
+      }
+    }
     // This chat is now on the work it just created: anything it was still owed
     // (the creation line naming what the person set for this work) follows it.
     carryPendingPersonLines(projectDir, initialSelection.sessionId);
     if (questionId !== undefined) retireRequest(projectDir, questionId);
+    listed = { dirName: created.dirName, space: created.space };
   }, undefined, undefined, WORKSPACE_MUTATION_LOCK_RETRIES);
+  if (saveAs !== undefined && listed !== null) {
+    saveRunningPlan(projectDir, saveAs, [], listed.dirName, listed.space,
+      ` The work was created; run \`${aidlcDispatcherInvocation("scope save")} --name ${saveAs}\` to save its plan.`);
+  }
 }
 
 // The scope→stage state-build half of creation: the workspace detection + state
@@ -8599,7 +8751,7 @@ function handleIntentCreateStateBuild(
   for (const stage of graph) {
     const action = planStages[stage.slug] || "SKIP";
     if (action === "EXECUTE") {
-      executeStages.push(stage.number);
+      executeStages.push(`${stage.number} (${stage.slug})`);
     } else {
       skipStages.push(`${stage.number} (${stage.slug})`);
     }
@@ -8612,7 +8764,7 @@ function handleIntentCreateStateBuild(
       adjustedMapping["reverse-engineering"] = "SKIP";
       const reStage = graph.find((s) => s.slug === "reverse-engineering");
       if (reStage) {
-        const idx = executeStages.indexOf(reStage.number);
+        const idx = executeStages.indexOf(`${reStage.number} (${reStage.slug})`);
         if (idx >= 0) executeStages.splice(idx, 1);
         skipStages.push(`${reStage.number} ${GREENFIELD_RE_SKIP_LABEL}`);
       }
@@ -8692,7 +8844,12 @@ function handleIntentCreateStateBuild(
   const nextAfterFirst = nextInScopeStage(firstPostInit, scope, stageProgress);
   const nextStageName = nextAfterFirst ? nextAfterFirst.slug : "none";
 
-  const rawProjectDesc = flags.arguments || "[Project description]";
+  // The committed description and its Project preview keep key shapes masked
+  // (SECRET_SHAPES); the person's whole message stays in the git-ignored
+  // message record.
+  const typedProjectDesc = flags.arguments || "[Project description]";
+  const rawProjectDesc = maskSecretShapes(typedProjectDesc);
+  if (rawProjectDesc !== typedProjectDesc) saySecretMaskedOnce(projectDir);
   const descriptionAuthority = authoritativeProjectDescription(rawProjectDesc);
   const previewSource = descriptionAuthority.pastedDocumentPresent
     ? descriptionAuthority.description || "[Pasted document provided]"
@@ -8867,7 +9024,7 @@ ${stageProgress}
   process.stdout.write(
     `Intent created: ${createdDir} (space: ${createdSpace})
 State initialized: ${scope} scope, ${shownInScope} stages, ${effectiveDepth} depth
-${composedPlan ? `Plan: ${composedPlanLabel(flags["plan-name"])}, for this piece of work only (no scope file written)\n` : ""}Project type: ${projectType}${declaredType ? " (you said so)" : ""}
+${composedPlan ? `Plan: ${composedPlanLabel(flags["plan-name"])}${flags["save-as"] === undefined ? ", for this piece of work only (no scope file written)" : ""}\n` : ""}Project type: ${projectType}${declaredType ? " (you said so)" : ""}
 ${declaredType === "Brownfield" && scan.projectType !== "Brownfield" ? `${NO_CODE_FOUND_YET}\n` : ""}Languages: ${scan.languages}
 Frameworks: ${scan.frameworks}
 Build System: ${scan.buildSystem}
@@ -9041,7 +9198,7 @@ function handleIntent(
     return;
   }
   if (verbOrTarget === "add-repo" || verbOrTarget === "remove-repo") {
-    handleIntentRepos(projectDir, verbOrTarget, positional[2]);
+    handleIntentRepos(projectDir, verbOrTarget, positional[2], flags, missingValueFlags);
     return;
   }
   if (verbOrTarget === "set-repos") {
@@ -9381,33 +9538,85 @@ function handleIntentLifecycle(
   );
 }
 
-// `/aidlc intent add-repo <name>` / `/aidlc intent remove-repo <name>`: the
-// person's own change to which sibling repos a piece of work touches, for work
-// that already records repos (work with none treats the workspace folder itself
-// as its repo; `workspace reclassify` records its first repos). The name must be
-// a repo name and the folder a real Git checkout under the workspace: a commit
-// can never carry a .git entry, so a committed folder merely shaped like a repo
-// is refused and its config never read. Allowed until Units Generation is
-// approved: after that each Unit names its repo, so the command changes nothing
-// and asks the go-back question instead. Same locks (workspace, then intent)
-// and audit-first order as the lifecycle verbs.
+// `/aidlc intent add-repo <name> [--url <address>] [--reason <text>]
+// [--person-words <their words>]` / `/aidlc intent remove-repo <name>`: which
+// sibling repos a piece of work touches, for work that already records repos
+// (work with none treats the workspace folder itself as its repo; `workspace
+// reclassify` records its first repos). The name must be a repo name and the
+// folder a real Git checkout under the workspace: a commit can never carry a
+// .git entry, so a committed folder merely shaped like a repo is refused and its
+// config never read. A repo not on disk yet is cloned first, by workspace-sync's
+// own code and the person's own git: into a staging folder with no lock held,
+// then installed under the workspace lock with repos.json, its .gitignore block
+// and aidlc.code-workspace, and only then the audit row and the registry (the
+// intent lock, inside it). A failed clone records nothing. After Units
+// Generation is approved the change lands too; unitsRepoChange says what it
+// means for the approved Units.
 function handleIntentRepos(
   projectDir: string,
   verb: "add-repo" | "remove-repo",
   name: string | undefined,
+  flags: Record<string, string>,
+  missingValueFlags: ReadonlySet<string>,
 ): void {
-  if (!name) die(`Usage: aidlc-utility intent ${verb} <name>`);
-  if (!isValidRepoName(name)) {
-    die(`intent ${verb} refused: "${name}" is not a repo name (one folder name under the workspace, no separators).`);
+  if (!name) {
+    die(`Usage: aidlc-utility intent ${verb} <name>${verb === "add-repo" ? " [--url <address>] [--reason <text>] [--person-words <their words>]" : ""}`);
   }
+  if (!isValidRepoName(name)) {
+    die(`intent ${verb} refused: "${name}" is not a repo name: its name ${repoNameProblem(name)}.`);
+  }
+  for (const flag of ["url", "reason", "person-words"]) {
+    if (missingValueFlags.has(flag)) die(`intent ${verb} refused: --${flag} needs a value.`);
+  }
+  if (verb === "remove-repo" && flags.url !== undefined) die("intent remove-repo takes no --url: the folder stays where it is.");
+  // The audit is committed: an address with a credential in either is kept
+  // with its userinfo hidden, as every printed address is.
+  const reason = auditReason(flags.reason === undefined ? undefined : maskUserinfo(flags.reason));
+  const personWords = maskUserinfo(flags["person-words"]?.replace(/\s+/g, " ").trim() ?? "") || null;
   const selection = resolveWorkflowSelection(projectDir);
   const space = selection.space;
   const dirName = selection.intent;
   if (!dirName) {
     die(`No piece of work is active in space "${space}"; switch to one first (${entrySkillInvocation()} intent list).`);
   }
-  const outcome = withAuditLock(projectDir, () =>
-    withAuditLock(projectDir, () => {
+  const target = repoDir(projectDir, name);
+  // Checked before anything is cloned, and again under the locks.
+  const recorded = readIntentRegistry(projectDir, space).find((entry) => recordDirMatches(entry, dirName))?.repos ?? [];
+  const clone = verb === "add-repo" && recorded.length > 0 && !recorded.includes(name) && !pathEntryExists(target)
+    ? plannedRepoClone(projectDir, name, flags.url)
+    : null;
+  let staged: StagedWorkspaceRepo | null = null;
+  if (clone !== null) {
+    try {
+      staged = stageWorkspaceRepo(projectDir, clone.org, clone.repo);
+    } catch (err) {
+      const url = clone.repo.url ?? `git@github.com:${clone.org}/${name}.git`;
+      const address = maskUserinfo(url);
+      const why = err instanceof CloneFailure ? err.reason : maskUserinfo(errorMessage(err));
+      // The clone stageWorkspaceRepo makes, with the credential left for the person to put back.
+      const byHand = `git clone ${clone.repo.branch ? `--branch ${clone.repo.branch} ` : ""}-- ` +
+        `${address === url ? `"${url}"` : "<the address with its credential>"} "${target}"`;
+      die(`Could not clone ${name} from ${address}: ${why}. Nothing was changed. To clone it yourself, run ${byHand}, then add it again.`);
+    }
+  }
+  const outcome = withAuditLock(projectDir, () => {
+    if (staged !== null && isGitRepoDir(target)) {
+      // Cloned here meanwhile (another chat, workspace-sync): it is on disk.
+      discardStagedWorkspaceRepo(staged);
+      staged = null;
+    } else if (staged !== null && clone !== null) {
+      try {
+        installWorkspaceRepo(projectDir, staged, clone.manifest);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code ?? "";
+        die(
+          ["EACCES", "EBUSY", "EPERM"].includes(code)
+            ? `Could not move the new clone of ${name} into place: another program has a file in it open. Nothing was changed; add it again.`
+            : `Could not put the new clone of ${name} in place: ${maskUserinfo(errorMessage(err))}`,
+        );
+      }
+    }
+    return withAuditLock(projectDir, () => {
       const list = readIntentRegistry(projectDir, space);
       const row = list.find((entry) => recordDirMatches(entry, dirName));
       if (!row) {
@@ -9419,11 +9628,10 @@ function handleIntentRepos(
       }
       const state = readStateFile(projectDir, dirName, space);
       const boxes = new Map(parseCheckboxes(state).map((box) => [box.slug, box.state]));
-      if (boxes.get("units-generation") === "completed") return { kind: "cutoff" as const };
       if (verb === "add-repo") {
         if (current.includes(name)) return { kind: "already" as const };
-        if (!isGitRepoDir(repoDir(projectDir, name))) {
-          die(`intent add-repo refused: "${name}" is not a Git checkout under the workspace folder (no .git entry at ${repoDir(projectDir, name)}). Clone or create the repo there first.`);
+        if (!isGitRepoDir(target)) {
+          die(`intent add-repo refused: "${name}" is not a Git checkout under the workspace folder (no .git entry at ${target}). Clone or create the repo there first.`);
         }
       } else {
         if (!current.includes(name)) return { kind: "absent" as const, current };
@@ -9432,12 +9640,17 @@ function handleIntentRepos(
         }
       }
       const next = verb === "add-repo" ? [...current, name].sort() : current.filter((repo) => repo !== name);
+      const stage = (getField(state, "Current Stage") ?? "").trim() || "none";
       appendAuditEntryUnlocked(
         "INTENT_REPOS_CHANGED",
         {
-          Stage: (getField(state, "Current Stage") ?? "").trim() || "none",
+          Stage: stage,
           [verb === "add-repo" ? "Added" : "Removed"]: name,
           Repos: next.join(", "),
+          ...(staged !== null && clone !== null ? { "Cloned From": maskUserinfo(clone.repo.url ?? `git@github.com:${clone.org}/${name}.git`) } : {}),
+          ...(reason ? { Reason: reason } : {}),
+          ...(personWords ? { "Person Words": personWords } : {}),
+          ...(verb === "add-repo" ? repoBaselineAdditionField(projectDir, [name], dirName, space) : {}),
         },
         projectDir,
         dirName,
@@ -9447,19 +9660,17 @@ function handleIntentRepos(
       writeIntentRegistry(projectDir, list, space);
       const reAction = parseStateStageSuffixes(state).get("reverse-engineering") ??
         loadScopeMapping()[getField(state, "Scope") ?? ""]?.stages["reverse-engineering"];
-      return { kind: "changed" as const, reState: boxes.get("reverse-engineering"), reAction };
-    }, dirName, space),
-  );
+      return {
+        kind: "changed" as const,
+        reState: boxes.get("reverse-engineering"),
+        reAction,
+        units: unitsRepoChangeAtChange(projectDir, state, stage, dirName, space),
+      };
+    }, dirName, space);
+  });
   // What the person hears: what happened and the way back, in their words.
   const lines: string[] = [];
   switch (outcome.kind) {
-    case "cutoff":
-      lines.push(
-        verb === "add-repo"
-          ? `Units Generation is already approved, so its Units do not cover ${name}. Do you want me to go back to Units Generation with ${name} added?`
-          : `Units Generation is already approved, so its Units may be written for ${name}. Do you want me to go back to Units Generation without ${name}?`,
-      );
-      break;
     case "already":
       lines.push(`${name} is already one of this piece of work's repos; nothing changed.`);
       break;
@@ -9468,33 +9679,143 @@ function handleIntentRepos(
       break;
     case "changed":
       if (verb === "add-repo") {
-        lines.push(`Added ${name} to this piece of work's repos.`);
+        if (staged !== null && clone !== null) {
+          lines.push(`Cloned ${name} from ${maskUserinfo(clone.repo.url ?? `git@github.com:${clone.org}/${name}.git`)} and added it to this piece of work's repos.`);
+          if (clone.note !== null) lines.push(clone.note);
+        } else {
+          lines.push(`Added ${name} to this piece of work's repos.`);
+        }
         if (outcome.reState === "completed") {
           lines.push(`Reverse Engineering has not documented ${name} yet, so it and the stages that read the code knowledge may show as behind until you revisit them.`);
         } else if (outcome.reAction === "EXECUTE") {
           lines.push(`Reverse Engineering will cover ${name} when it runs.`);
         }
+        if (outcome.units !== null) lines.push(outcome.units);
         lines.push("You can remove it again any time.");
       } else {
-        lines.push(`Removed ${name} from this piece of work's repos. You can add it back any time.`);
+        const listed = workspaceManifestNames(projectDir).includes(name);
+        lines.push(
+          `Removed ${name} from this piece of work's repos. Its folder stays` +
+            (listed ? ", and so does its line in repos.json (delete that line to take it off the workspace's list)." : "."),
+        );
+        if (outcome.units !== null) lines.push(outcome.units);
+        lines.push("You can add it back any time.");
       }
       break;
   }
   process.stdout.write(`${lines.join(" ")}\n`);
 }
 
+// After a change to the repos lands: under relaxed or off, a change since Units
+// Generation was approved is recorded as accepted and its line returned; under
+// strict the next step asks once, so the question is cleared to be put afresh.
+function unitsRepoChangeAtChange(
+  projectDir: string,
+  state: string,
+  stage: string,
+  intent: string,
+  space: string,
+): string | null {
+  const change = unitsRepoChange(projectDir, state, intent, space);
+  if (change === null) return null;
+  clearUnitsReposAsked(projectDir);
+  if (governedGuardPolicy(projectDir, state, { intent, space }).value === "strict") return null;
+  return recordAcceptedChanges(projectDir, [unitsRepoChangeAcceptance(change, stage)], { intent, space })[0] ?? null;
+}
+
+// By lstat: a link that leads nowhere is still in the way of a clone.
+function pathEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The repo names repos.json lists, or none when it is absent or unreadable.
+function workspaceManifestNames(projectDir: string): string[] {
+  try {
+    return parseWorkspaceManifest(readFileSync(join(projectDir, "repos.json"), "utf-8")).repos.map((repo) => repo.name);
+  } catch {
+    return [];
+  }
+}
+
+// Where a repo not on disk is cloned from and what repos.json becomes: its own
+// entry, else the person's `--url`, else the repos.json `org`. The address goes
+// to git as given; repos.json, which the team commits, gets it without
+// credentials. With no repos.json, a hosted `--url` creates one naming its owner
+// as the org; a local path or another shape creates none, and the line says so.
+function plannedRepoClone(
+  projectDir: string,
+  name: string,
+  url: string | undefined,
+): { repo: WorkspaceRepoEntry; org: string; manifest: { raw: string | null; next: string | null }; note: string | null } {
+  const path = join(projectDir, "repos.json");
+  const raw = existsSync(path) ? readFileSync(path, "utf-8") : null;
+  let manifest: WorkspaceManifest | null = null;
+  if (raw !== null) {
+    try {
+      manifest = parseWorkspaceManifest(raw);
+    } catch (err) {
+      die(`${name} is not in this workspace yet, and repos.json cannot be read to clone it (${errorMessage(err)}). Nothing was changed.`);
+    }
+  }
+  const entry = manifest?.repos.find((repo) => repo.name === name);
+  if (manifest !== null && entry !== undefined) {
+    return {
+      repo: url === undefined ? entry : { ...entry, url },
+      org: manifest.org,
+      manifest: { raw, next: null },
+      note: null,
+    };
+  }
+  if (url === undefined && manifest === null) {
+    die(
+      `${name} is not in this workspace yet, and there is no repos.json with an org to clone it from. ` +
+        "Give its clone address with --url, or clone it beside the other repos, then add it again.",
+    );
+  }
+  const kept = url === undefined ? undefined : withoutCredentials(url);
+  const written: WorkspaceRepoEntry = { name, ...(kept === undefined ? {} : { url: kept }) };
+  const stripped = kept !== url ? " Its address there leaves out the credential." : "";
+  const repo: WorkspaceRepoEntry = { name, ...(url === undefined ? {} : { url }) };
+  if (manifest !== null) {
+    const next = workspaceManifestWith(raw, manifest.org, written);
+    if (next === null) die(`${name} could not be added to repos.json, which has no repos list. Nothing was changed.`);
+    return { repo, org: manifest.org, manifest: { raw, next }, note: `repos.json now lists it.${stripped}` };
+  }
+  const owner = hostedAddressOwner(url!);
+  if (owner === null) {
+    return {
+      repo,
+      org: "",
+      manifest: { raw: null, next: null },
+      note: "This workspace has no repos.json, so a teammate's workspace does not get it by itself.",
+    };
+  }
+  return {
+    repo,
+    org: owner,
+    manifest: { raw: null, next: workspaceManifestWith(null, owner, written) },
+    note: `repos.json is new: it lists ${name} under the org ${owner}; commit it to share the list with your team.${stripped}`,
+  };
+}
+
 // `/aidlc intent set-repos <name,...>`: the whole repo set at once, the exact
 // names the agent read from the person's words (Reverse Engineering's question,
 // or their own "only these"); `--all` keeps the set recorded. Either way the set
 // is then the person's (`repos_named`), so that question is not put again. Each
-// name passes add-repo's checks before anything changes; same locks,
-// audit-first order and Units Generation cut-off as add-repo.
+// name passes add-repo's checks before anything changes, and a name not cloned
+// here is add-repo's to clone; same locks, audit-first order and Units
+// Generation rule (unitsRepoChange) as add-repo.
 function handleIntentSetRepos(projectDir: string, list: string | undefined, all: boolean): void {
   const names = all ? null : [...new Set((list ?? "").split(",").map((name) => name.trim()).filter((name) => name.length > 0))].sort();
   if (names !== null && names.length === 0) die("Usage: aidlc-utility intent set-repos <name,...> | --all");
   for (const name of names ?? []) {
     if (!isValidRepoName(name)) {
-      die(`intent set-repos refused: "${name}" is not a repo name (one folder name under the workspace, no separators). Nothing was changed.`);
+      die(`intent set-repos refused: "${name}" is not a repo name: its name ${repoNameProblem(name)}. Nothing was changed.`);
     }
   }
   const selection = resolveWorkflowSelection(projectDir);
@@ -9518,23 +9839,24 @@ function handleIntentSetRepos(projectDir: string, list: string | undefined, all:
       const added = next.filter((repo) => !current.includes(repo));
       const removed = current.filter((repo) => !next.includes(repo));
       const state = readStateFile(projectDir, dirName, space);
-      const boxes = new Map(parseCheckboxes(state).map((box) => [box.slug, box.state]));
-      if ((added.length > 0 || removed.length > 0) && boxes.get("units-generation") === "completed") {
-        return { kind: "cutoff" as const, next };
-      }
       for (const name of added) {
         if (!isGitRepoDir(repoDir(projectDir, name))) {
-          die(`intent set-repos refused: "${name}" is not a Git checkout under the workspace folder (no .git entry at ${repoDir(projectDir, name)}). Nothing was changed.`);
+          die(
+            `intent set-repos refused: "${name}" is not a Git checkout under the workspace folder (no .git entry at ${repoDir(projectDir, name)}). ` +
+              `Nothing was changed. To clone it and add it to this work, run \`${aidlcDispatcherInvocation(`intent add-repo ${quoteCommandArgument(name)}`)}\`.`,
+          );
         }
       }
+      const stage = (getField(state, "Current Stage") ?? "").trim() || "none";
       appendAuditEntryUnlocked(
         "INTENT_REPOS_CHANGED",
         {
-          Stage: (getField(state, "Current Stage") ?? "").trim() || "none",
+          Stage: stage,
           ...(added.length > 0 ? { Added: added.join(", ") } : {}),
           ...(removed.length > 0 ? { Removed: removed.join(", ") } : {}),
           Repos: next.join(", "),
           Named: "by the person",
+          ...(added.length > 0 ? repoBaselineAdditionField(projectDir, added, dirName, space) : {}),
         },
         projectDir,
         dirName,
@@ -9543,24 +9865,19 @@ function handleIntentSetRepos(projectDir: string, list: string | undefined, all:
       row.repos = next;
       row.repos_named = true;
       writeIntentRegistry(projectDir, rows, space);
-      return { kind: "changed" as const, next, removed };
+      return { next, removed, units: unitsRepoChangeAtChange(projectDir, state, stage, dirName, space) };
     }, dirName, space),
   );
   const named = (repos: string[]): string =>
     repos.length >= MANY_REPOS ? `${repos.length} repositories`
     : repos.length === 1 ? repos[0]
     : `${repos.slice(0, -1).join(", ")} and ${repos[repos.length - 1]}`;
-  if (outcome.kind === "cutoff") {
-    process.stdout.write(
-      `Units Generation is already approved, so its Units are written for the repos this work recorded. Do you want me to go back to Units Generation with ${named(outcome.next)}?\n`,
-    );
-    return;
-  }
   const covers = all ? `This work covers all ${outcome.next.length} of its repositories.` : `This work now covers ${named(outcome.next)}.`;
+  const units = outcome.units === null ? "" : ` ${outcome.units}`;
   const back = outcome.removed.length === 0 ? ""
     : outcome.removed.length === 1 ? ` ${outcome.removed[0]} can be added back any time.`
     : ` The ${outcome.removed.length} left out can be added back any time.`;
-  process.stdout.write(`${covers}${back}\n`);
+  process.stdout.write(`${covers}${units}${back}\n`);
 }
 
 // `/aidlc intent add-checkout <path>` / `/aidlc intent remove-checkout <path>`:
@@ -9568,9 +9885,8 @@ function handleIntentSetRepos(projectDir: string, list: string | undefined, all:
 // (a worktree in a harness folder such as .claude/worktrees/, or one outside
 // the project), so the review binds it and the source-work check finds it; or
 // take it out again. The agent runs it from its own knowledge of where it wrote
-// the code, or the person does; it never asks. Unlike add-repo it has no Units
-// Generation cut-off (it is needed in Code Generation), works for work that
-// records no repos, and takes a path. The folder needs a real .git entry; a
+// the code, or the person does; it never asks. Unlike add-repo it works for work
+// that records no repos, and takes a path. The folder needs a real .git entry; a
 // path the review already reaches, or inside AI-DLC's own folders, is refused
 // with the reason. Same locks and audit-first order as add-repo; the record is
 // the intent's per-clone .aidlc-engine/ file, never the audit row.
@@ -9793,7 +10109,8 @@ function handleSpace(projectDir: string, positional: string[], flags: Record<str
 // deterministic space-level per-repo codekb directory (forward-slash, workspace-
 // relative) the reverse-engineering stage writes its 9 artifacts into. The repo
 // is the caller-supplied --repo, else the engine-resolved codekbRepoName (the
-// lone recorded repo, or basename(projectDir) when none is recorded). No mkdir,
+// lone recorded repo, or the project folder's name as a repo name when none is
+// recorded). No mkdir,
 // no state read, no audit — mirrors the intent/space read-only query arms.
 function handleCodekbPath(projectDir: string, flags: Record<string, string>): void {
   const asJson = flags.json === "true";
@@ -9823,8 +10140,16 @@ function handleCodekbPath(projectDir: string, flags: Record<string, string>): vo
 // (see onboardDocumentInput). The stage says the line naming which file it read
 // or copied as soon as it gets it.
 function handleProjectDescription(projectDir: string): void {
-  const recordRoot = dirname(stateFilePath(projectDir));
-  const authority = readProjectDescriptionAuthority(recordRoot);
+  // With no work, a stage run on its own describes itself with the words typed
+  // with it, or with none: the agent then asks what it is for.
+  const isolated = existsSync(stateFilePath(projectDir)) ? null : singleRunRequest(projectDir);
+  if (isolated !== null && isolated.description === null) {
+    process.stdout.write(`${JSON.stringify({ description: null, source: null })}\n`);
+    return;
+  }
+  const authority = isolated !== null && isolated.description !== null
+    ? { description: isolated.description, source: `single-stage:${isolated.stage}` }
+    : readProjectDescriptionAuthority(dirname(stateFilePath(projectDir)));
   // A pasted document is split here, by the tool, so the stage never has to
   // find where the person's own words end.
   const split = authoritativeProjectDescription(authority.description);
@@ -10307,7 +10632,9 @@ function onboardDocumentInput(
       ? ` I couldn't read any text from it: ${documentInputNoTextReason(shown)}.`
       : "") +
     (truncated
-      ? ` Its text is cut off at ${shown.extraction.chars ?? kb.EXTRACT_OUTPUT_CHAR_CAP} characters.`
+      ? shown.extraction.pages_kept !== undefined
+        ? ` Only its first ${shown.extraction.pages_kept} pages were read.`
+        : ` Its text is cut off at ${shown.extraction.chars ?? kb.EXTRACT_OUTPUT_CHAR_CAP} characters.`
       : "");
 
   process.stdout.write(
@@ -10528,8 +10855,13 @@ function documentInputNoTextReason(shown: { state: string }): string {
 // and any other moves the copy to <stem>-2<ext>, -3, and so on. Leading dots
 // are dropped and the names the knowledge walk skips are passed over, so a
 // later sync still sees the copy. The bytes land in a dot-named staging file
-// first and are published with link(), which never replaces a name.
+// first and are published with installWithoutReplacing, which never replaces a
+// name, whichever temp folder or computer the other copy runs from.
 const DOCUMENT_INPUT_COPY_NAME_LIMIT = 100;
+// ponytail: a 0-byte file made this second may be another copy's claim that
+// fills a moment later; a claim that takes over a second to fill leaves a -2
+// copy with the same bytes.
+const DOCUMENT_INPUT_CLAIM_SETTLE_MS = 1_000;
 
 function copyIntoDocuments(
   kb: typeof import("./aidlc-knowledge.ts"),
@@ -10547,7 +10879,15 @@ function copyIntoDocuments(
     const target = join(documentsReal, candidate);
     // A file already at this name with the same bytes is this copy already.
     const holdsSameBytes = (): boolean => {
-      const existing = lstatSync(target, { throwIfNoEntry: false });
+      let existing = lstatSync(target, { throwIfNoEntry: false });
+      for (
+        const deadline = Date.now() + DOCUMENT_INPUT_CLAIM_SETTLE_MS;
+        existing?.isFile() && existing.size === 0 && bytes.length > 0 &&
+        Date.now() - existing.mtimeMs < DOCUMENT_INPUT_CLAIM_SETTLE_MS && Date.now() < deadline;
+      ) {
+        Bun.sleepSync(5);
+        existing = lstatSync(target, { throwIfNoEntry: false });
+      }
       if (existing === undefined || !existing.isFile() || existing.size !== bytes.length) return false;
       try {
         return kb.sha256Hex(kb.readDocumentBytes(target, candidate, undefined, bytes.length)) === digest;
@@ -10562,7 +10902,7 @@ function copyIntoDocuments(
     const staged = join(documentsReal, `.aidlc-document-input-${process.pid}-${randomUUID()}.tmp`);
     try {
       writeFileSync(staged, bytes, { flag: "wx" });
-      linkSync(staged, target);
+      installWithoutReplacing(staged, target);
       return { target, created: true };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -10600,7 +10940,7 @@ function resolveCodekbRepo(
     ? flags.repo
     : codekbRepoName(projectDir, space, selection.intent ?? undefined);
   if (!isValidRepoName(repo)) {
-    die(`Invalid --repo "${repo}": a repo name must be one path segment.`);
+    die(repoNameRefusal("Invalid --repo", repo));
   }
   const sourceDir = codekbSourceRoot(projectDir, repo, space);
   return {
@@ -11067,6 +11407,32 @@ function comparedScopeDraft(
   return rel === `inception/reverse-engineering/${name}` ? { record, rel } : null;
 }
 
+// The store is the stage's own work in hand: the attempt in progress (the
+// isolated run's while one is open and the step in hand is it, the main
+// workflow's otherwise) recorded this repo's whole link chain since the stage
+// last started, was jumped to or was asked to change, under any Guard Policy.
+// Read again by a new chat, such a store was offered back for reuse, and Reuse
+// recorded a stage that ran as skipped. The final link is recorded only after
+// the nine files are published, so the chain is the whole fact; a file time
+// (rewritten by every clone and checkout) and the store's own `intent:` line
+// (checked by none) are not read.
+function scannedThisAttempt(projectDir: string, repo: string): boolean {
+  const stage = findStageBySlug("reverse-engineering");
+  if (!stage) return false;
+  try {
+    const singleRun = issuedStepIsIsolatedRun(projectDir, stage.slug) &&
+      singleStageAttemptIsOpen(projectDir, stage.slug);
+    const since = Date.parse(pipelineAttemptStartedAt(projectDir, stage.slug, { singleRun }));
+    if (Number.isNaN(since)) return false;
+    const chainRepo = intentRepos(projectDir).length > 0 ? repo : null;
+    const { links, receipts } = pipelineLinkEvidence(projectDir, stage, { singleRun });
+    return links.every((link) => receipts.some((receipt) =>
+      receipt.repo === chainRepo && receipt.link === link && Date.parse(receipt.timestamp) >= since));
+  } catch {
+    return false;
+  }
+}
+
 function handleCodekbScopeDiff(projectDir: string, flags: Record<string, string>): void {
   const asJson = flags.json === "true";
   const selection = resolveWorkflowSelection(projectDir);
@@ -11233,6 +11599,14 @@ function handleCodekbScopeDiff(projectDir: string, flags: Record<string, string>
   }
 
   // Status mode.
+  if (scannedThisAttempt(projectDir, repo)) {
+    emit(
+      { verdict: "SCANNED", store_intent: store.intent, kind: store.kind, analyzed_paths: store.analyzedPaths },
+      `SCANNED: this run of Reverse Engineering already scanned ${repo} and published this store; there is ` +
+        "nothing to reuse or rescan.",
+    );
+    return;
+  }
   const currentFingerprint =
     store.analyzedPaths.length > 0
       ? codekbScopeFingerprint(repoDir, store.analyzedPaths, fingerprintExcludes)
@@ -11320,54 +11694,6 @@ function handleDetect(projectDir: string, flags: Record<string, string>): void {
 // reclassify - the person says the work is a new project or existing code
 // ---------------------------------------------------------------------------
 
-const STARTED_STATES: ReadonlySet<string> = new Set(["in-progress", "awaiting-approval", "revising", "completed"]);
-
-// True once a Construction or Operation stage has started. From then on the
-// folder holds code AI-DLC wrote, so the scan no longer tells new from
-// existing, and the workflow is not moved back into Inception.
-export function constructionHasStarted(content: string, workRecordDir?: string | null): boolean {
-  // Construction output in the record means this work has built: a jump back
-  // resets its stages, but the code in the folder is still its own.
-  if (workRecordDir && holdsAnyFile(join(workRecordDir, "construction"))) return true;
-  const states = new Map(parseCheckboxes(content).map((c) => [c.slug, c.state]));
-  const started = loadStageGraph().filter((stage) =>
-    (stage.phase === "construction" || stage.phase === "operation") &&
-    STARTED_STATES.has(states.get(stage.slug) ?? "pending"));
-  if (started.length !== 1 || !workRecordDir) return started.length > 0;
-  // Only just entered: an approval moved the cursor onto the first
-  // Construction stage and nothing of it is written yet, so nothing was built
-  // for a new project. A jump straight into Operation is work under way.
-  const [only] = started;
-  return !(
-    only.phase === "construction" &&
-    only.slug === getField(content, "Current Stage") &&
-    states.get(only.slug) === "in-progress" &&
-    !holdsAnyFile(join(workRecordDir, "construction"))
-  );
-}
-
-function holdsAnyFile(dir: string): boolean {
-  if (!existsSync(dir)) return false;
-  return readdirSync(dir, { withFileTypes: true })
-    .some((entry) => entry.isDirectory() ? holdsAnyFile(join(dir, entry.name)) : true);
-}
-
-// Reverse Engineering is on the plan and has not run, the workflow is past it,
-// and Construction has not started: it runs now and the workflow then returns
-// to the stage the person was on (`next` names that move; reclassify says so).
-export function reverseEngineeringOwedBehindCursor(content: string, workRecordDir?: string | null): boolean {
-  const graph = loadStageGraph();
-  const reIndex = graph.findIndex((stage) => stage.slug === "reverse-engineering");
-  const currentIndex = graph.findIndex((stage) => stage.slug === getField(content, "Current Stage"));
-  if (reIndex < 0 || currentIndex <= reIndex) return false;
-  const scope = getField(content, "Scope") ?? "";
-  const action = parseStateStageSuffixes(content).get("reverse-engineering") ??
-    loadScopeMapping()[scope]?.stages["reverse-engineering"];
-  return action === "EXECUTE" &&
-    parseCheckboxes(content).find((c) => c.slug === "reverse-engineering")?.state === "pending" &&
-    !constructionHasStarted(content, workRecordDir);
-}
-
 // The state already holds this type as the person's word, so a request that
 // names it again has nothing to record.
 export function projectTypeRecordedAsPersons(content: string, type: string): boolean {
@@ -11437,8 +11763,10 @@ function projectTypeWords(type: string): string {
 // write, audited first. Moving the workflow back to run it is `next`'s job.
 function handleReclassify(projectDir: string, flags: Record<string, string>, rawArgs: readonly string[]): void {
   const usage = (message: string): never =>
-    die(`${message}\nUsage: workspace reclassify --project-type <greenfield|brownfield> [--intent <slug>] [--space <name>] [--person-words <their words> | --person-words-file <file>] [--then-rerun] [--project-dir <path>]`);
-  const allowed = new Set(["project-type", "intent", "space", "person-words", "person-words-file", "then-rerun", "project-dir"]);
+    die(`${message}\nUsage: workspace reclassify --project-type <greenfield|brownfield> [--intent <slug>] [--space <name>] [--message <id>] [--then-rerun] [--project-dir <path>]`);
+  const allowed = new Set([
+    "project-type", "intent", "space", "message", "person-words", "person-words-file", "then-rerun", "project-dir",
+  ]);
   for (const arg of rawArgs) {
     if (!arg.startsWith("--")) continue;
     const name = arg.slice(2).split("=")[0];
@@ -11465,18 +11793,14 @@ function handleReclassify(projectDir: string, flags: Record<string, string>, raw
         `to the request that starts it (${entrySkillInvocation()} --project-type ${declared.toLowerCase()} "<what to build>").`,
     );
   }
-  // The words the person said it in, given inline or left in the work's answer
-  // text file: recorded beside the change, and read by the check below. A file
-  // that cannot be read leaves them out; the change is recorded either way.
-  readPersonWordsFile(projectDir, flags, true);
-  const typedWords = flags["person-words"];
-  const personWords = typedWords === undefined || typedWords === "true"
-    ? undefined
-    : typedWords.replace(/\s+/g, " ").trim() || undefined;
+  // The message the person said it in (--message), proved: recorded beside the
+  // change, and read by the check below. Words from the form before --message
+  // are the agent's own text, recorded as such.
+  const named = setterMessage(projectDir, flags, true, { request: true });
   // What the folder is, is the person's word: it is recorded as theirs only
   // once they have said something since the last decision (an answer to the
   // question, or the command they typed), after the question when it was asked,
-  // or when the words are a whole message of theirs in this chat (the message
+  // or when the agent names the message of theirs that said it (the message
   // that started the work leaves no turn). The chat is the one running this
   // command, else the chat most recently active here. At the person's own
   // terminal no chat answer can arrive: the step that works there is named
@@ -11484,14 +11808,14 @@ function handleReclassify(projectDir: string, flags: Record<string, string>, raw
   if (!humanPresenceGuardDisabled() && !personSaidProjectType(projectDir, {
     chat: selection.sessionId ?? readCurrentSessionId(projectDir),
     type: declared === "Brownfield" ? "brownfield" : "greenfield",
-    words: personWords,
+    ...(named.message !== undefined ? { message: named.message } : {}),
     intent,
     space,
   })) {
     die(personAtOwnTerminal(projectDir)
       ? OWN_TERMINAL_PRESENCE_STEP
-      : "The person has not said yet whether this folder is existing code. Ask them the question you were given, " +
-        "end the turn, and run this command after they answer.");
+      : requestMessageStep(projectDir, "The person has not said yet whether this folder is existing code. Ask them " +
+        "the question you were given, end the turn, and run this command after they answer."));
   }
 
   // The registry row is workspace state and the plan is the work's own: hold
@@ -11565,7 +11889,12 @@ function handleReclassify(projectDir: string, flags: Record<string, string>, raw
         fields: {
           "Old Project Type": `${previous} (${previousSource})`,
           "New Project Type": `${declared} (${PROJECT_TYPE_SOURCE_PERSON})`,
-          ...(personWords !== undefined ? { "Person Words": personWords } : {}),
+          ...(named.message !== undefined
+            ? {
+              ...(named.message.words ? { "Person Reply": personsWordsText(named.message.words) } : {}),
+              "Message Id": named.message.id,
+            }
+            : named.agentText !== undefined ? { [CONDUCTOR_SUMMARY_FIELD]: named.agentText } : {}),
           "Scanned As": scan.projectType,
           Languages: scan.languages,
           Frameworks: scan.frameworks,
@@ -11602,7 +11931,6 @@ function handleReclassify(projectDir: string, flags: Record<string, string>, raw
       lines.push("This piece of work is finished, so its plan stays as it is; I'll check the folder again for the next piece of work.");
     } else if (declared === "Brownfield") {
       if (reverseEngineeringOwedBehindCursor(content, recordDir(projectDir, intent, space))) {
-        lines.push(`Next I'll document the code, then we're back at ${stageNames([getField(content, "Current Stage") ?? ""])}.`);
         const doneWithoutCode = parseCheckboxes(content)
           .filter((c) => c.state === "completed")
           .map((c) => findStageBySlug(c.slug))
@@ -11830,7 +12158,7 @@ function stagesStillToRun(content: string): StageEntry[] {
 function handleScopeChange(projectDir: string, flags: Record<string, string>): void {
   const newScope = flags.scope;
   if (!newScope) die("--scope is required for scope-change");
-  readPersonWordsFile(projectDir, flags);
+  const named = setterMessage(projectDir, flags, false, { request: Object.keys(intentSettingsFromFlags(flags)).length === 0 });
   const selection = resolveWorkflowSelection(projectDir, { intent: flags.intent, space: flags.space });
   const intent = selection.intent ?? undefined;
   const space = selection.space;
@@ -11841,27 +12169,44 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
     const scopeMapping = loadScopeMapping();
     const newScopeDef = scopeMapping[newScope];
     if (!newScopeDef) die(`Unknown scope: ${newScope}. Valid scopes: ${Object.keys(scopeMapping).join(", ")}`);
-    // The person's own request for the change, on this work's record, with no
-    // unattended driver in the way. One reply that approves and asks for the
-    // change does both: the approval recorded from it does not use it up.
+    // The person's own request for the change, with no unattended driver in
+    // the way: the message the agent names, or their turn on this work's
+    // record. One reply that approves and asks for the change does both: the
+    // approval recorded from it does not use it up.
     const personAsked = (): boolean =>
       process.env.AIDLC_UNATTENDED !== "1" &&
-      personSpokeSinceGate(projectDir, { requests: true, outlivesApproval: true, intent, space });
+      (named.message !== undefined || personAskedSinceGate(projectDir, { intent, space }));
     // Under "Continue automatically" the person's own scope change goes
     // through like any other, and the remaining work keeps their autonomy
     // choice. Only a change nobody asked for (an unattended driver) is
     // refused, naming the setter that lets it through. Keep this guard ahead
     // of the same-scope path, including no-ops.
     if (isAutonomousMode(contentBefore) && !personAsked()) {
+      // No request on record can be a person who is there; only an
+      // unattended run has nobody here.
+      const why = process.env.AIDLC_UNATTENDED === "1"
+        ? "with nobody here to approve the new plan" : "without a request from the person for this change on record";
       die(
         "Cannot change scope while Construction runs unattended (Construction Autonomy Mode is " +
-          "autonomous) with nobody here to approve the new plan. Run " +
+          `autonomous) ${why}. Run ` +
           `\`${aidlcToolInvocation("bolt")} set-autonomy --mode gated\` (Construction then stops for ` +
           "approval at each Bolt), then change scope.",
       );
     }
     const oldScope = getField(contentBefore, "Scope");
     if (!oldScope) die("Cannot read current Scope from state file.");
+    // The person's skips that land before the reopen picks a stage, the only
+    // ones `next` names here; recompose takes every other skip after the switch.
+    const typedSkips = splitSlugList(flags.skip);
+    const skippedFirst = oldScope === newScope ? [] : skipsBeforeReopen(contentBefore, newScope, typedSkips);
+    const strays = typedSkips.filter((slug) => !skippedFirst.includes(slug));
+    if (strays.length > 0) {
+      die(
+        `scope-change --skip takes only the stages the switch would reopen finished work at, and ${strays.join(", ")} ` +
+          `${strays.length === 1 ? "is" : "are"} not: run it without ${strays.length === 1 ? "that one" : "them"}, then ` +
+          `\`${aidlcDispatcherInvocation("recompose")} --skip ${strays.join(",")}\`.`,
+      );
+    }
     const requested = intentSettingsFromFlags(flags);
     let keptPolicyLine: string | null = null;
     if (oldScope !== newScope) {
@@ -11878,13 +12223,17 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
         const strictness = { off: 0, relaxed: 1, strict: 2 } as const;
         const nextPolicy = scopeDefinitionGuardPolicy(newScopeDef);
         // Scope changes raise the policy automatically. A lower default
-        // follows the scope only on the person's own request for the change,
-        // on this work's own record (the authority a direct Guard Policy
-        // lowering needs); otherwise the work keeps its value and the output
-        // says so in one line.
+        // follows the scope only when the change is the person's by the rule
+        // behind every "set by you" (settingTheirs): the message the agent
+        // names, their own terminal, or the scope typed on their own line,
+        // with no unattended driver in the way; otherwise the work keeps its
+        // value and the output says so in one line.
         if (strictness[nextPolicy] >= strictness[previousCC.value]) {
           requested["guard-policy"] ??= { value: nextPolicy, source };
-        } else if (personAsked()) {
+        } else if (
+          process.env.AIDLC_UNATTENDED !== "1" &&
+          settingTheirs(projectDir, selection.sessionId ?? null, "scope", newScope, named.message, { intent, space }) !== null
+        ) {
           requested["guard-policy"] ??= { value: nextPolicy, source };
         } else {
           // The person asked for the switch: the setting it kept is said as a
@@ -11905,37 +12254,31 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
     // Apply against the original scope so previous settings and effective
     // output describe the state before this transaction.
     const update = applyIntentSettings(projectDir, contentBefore, requested, {
-      intent, space, sessionId: selection.sessionId, fail: die, reviewScope: newScope, personWords: flags["person-words"],
+      intent, space, sessionId: selection.sessionId, fail: die, reviewScope: newScope, ...named,
     });
     let content = update.content;
     const auditEntries = update.audit;
     let outputLines = update.lines;
     // Finished work the new scope extends past its last stage is reopened at
-    // the first stage it adds (#2261); `next` reads the same predicate.
+    // the first stage it adds that the person did not skip with the switch
+    // (#2261); `next` reads the same predicate.
     let reopened: StageEntry | null = null;
     if (oldScope === newScope) {
       if (outputLines.length === 0) outputLines = [`Scope is already ${newScope}`];
     } else {
       const graph = loadStageGraph();
       const projectType = getField(content, "Project Type") || "Greenfield";
-      reopened = stageReopenedByScopeChange(contentBefore, newScope);
+      reopened = stageReopenedByScopeChange(contentBefore, newScope, skippedFirst);
 
-      // A scope's own stages on this project: a new project skips Reverse Engineering.
-      const gridFor = (def: { stages: Record<string, string> }): Record<string, string> => {
-        const grid = { ...def.stages };
-        if (projectType.toLowerCase() === "greenfield" && grid["reverse-engineering"] === "EXECUTE") {
-          grid["reverse-engineering"] = "SKIP";
-        }
-        return grid;
-      };
-      const adjustedMapping = gridFor(newScopeDef);
+      const adjustedMapping = scopeGridOnProject(newScopeDef, content);
+      for (const slug of skippedFirst) adjustedMapping[slug] = "SKIP";
 
       const executeStages: string[] = [];
       const skipStages: string[] = [];
       for (const stage of graph) {
         const action = adjustedMapping[stage.slug] || "SKIP";
         if (action === "EXECUTE") {
-          executeStages.push(stage.number);
+          executeStages.push(`${stage.number} (${stage.slug})`);
         } else {
           let reason = stage.slug;
           if (stage.slug === "reverse-engineering" && projectType.toLowerCase() === "greenfield" &&
@@ -12056,16 +12399,19 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
       // Switching back writes the old scope's own stages, so it is the way back
       // only when the old plan ran those for every stage still to run: a plan
       // tailored to the work, or recomposed, ran others.
-      const back = oldScopeDef ? gridFor(oldScopeDef) : null;
+      const back = oldScopeDef ? scopeGridOnProject(oldScopeDef, content) : null;
       const switchBackRestores = back !== null && stagesStillToRun(contentBefore).every((stage) =>
         (back[stage.slug] === "EXECUTE") === (effectivePlanAction(stage.slug, oldScope, contentBefore) === "EXECUTE"));
-      const oldExecuteCount = oldScopeDef
-        ? graph.filter(s => (oldScopeDef.stages[s.slug] || "SKIP") === "EXECUTE").length
-        : 0;
-      const stageDelta = executeStages.length - oldExecuteCount;
+      // The stages the work runs on the new plan, the one list each stage's
+      // start, the progress line and status count; the row says the same
+      // counts as the line, and its delta is from the count the old plan gave.
+      const work = { projectDir, intent, space };
+      const boxes = new Map(updatedCheckboxes.map((c) => [c.slug, c.state]));
+      const shown = plannedStages(content, newScope, work);
+      const shownDone = shown.filter((stage) => boxes.get(stage.slug) === "completed").length;
+      const shownGates = gridCostSummary(Object.fromEntries(shown.map((stage) => [stage.slug, "EXECUTE" as const]))).gates;
+      const stageDelta = shown.length - plannedStages(contentBefore, oldScope, work).length;
       const deltaStr = stageDelta >= 0 ? `+${stageDelta}` : String(stageDelta);
-      const summary = gridCostSummary(adjustedMapping as Record<string, "EXECUTE" | "SKIP">);
-      const gates = summary.gates;
       const effectiveDepth = getField(content, "Depth") || "unknown";
       auditEntries.unshift(
         {
@@ -12074,8 +12420,8 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
             "Old Scope": oldScope,
             "New Scope": newScope,
             "Stage Count Delta": deltaStr,
-            "Stages in Scope": String(executeStages.length),
-            "Approval Gates": String(gates),
+            "Stages in Scope": String(shown.length),
+            "Approval Gates": String(shownGates),
             Depth: effectiveDepth,
           },
         },
@@ -12087,6 +12433,17 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
             "Skip Kind": "scope-change",
           },
         })),
+        // The person's skips this switch carried out, as recompose records one.
+        ...(skippedFirst.length === 0 ? [] : [{
+          eventType: "RECOMPOSED",
+          fields: {
+            Scope: newScope,
+            "Stages skipped": skippedFirst.join(", "),
+            "Stages added": "none",
+            "Stages in Scope": String(executeStages.length),
+            Reason: PERSON_ASKED_SKIP_REASON,
+          },
+        }]),
       );
       if (reopened) {
         auditEntries.push({
@@ -12102,17 +12459,6 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
         });
       }
       const droppedUnitWork = droppedUnitWorkLine(projectDir, contentBefore, content, intent, space);
-      // The stages the work runs on the new plan, from the one list the
-      // progress line and status count, less each stage the new plan adds
-      // behind the cursor: it never runs unless the person goes back to it.
-      // Reverse Engineering owed there stays, since `next` runs it.
-      const boxes = new Map(updatedCheckboxes.map((c) => [c.slug, c.state]));
-      const reOwed = reverseEngineeringOwedBehindCursor(content, recordDir(projectDir, intent, space));
-      const shown = plannedStages(content, newScope).filter((stage) =>
-        !(cursorPastStage(content, stage.slug) && (boxes.get(stage.slug) ?? "pending") === "pending") ||
-        (stage.slug === "reverse-engineering" && reOwed));
-      const shownDone = shown.filter((stage) => boxes.get(stage.slug) === "completed").length;
-      const shownGates = gridCostSummary(Object.fromEntries(shown.map((stage) => [stage.slug, "EXECUTE" as const]))).gates;
       // What happened and how to go back, then each stage it skipped, the Unit
       // work it dropped, and each setting whose value changed. Whether the
       // work goes on in the same turn is `next`'s call (its scope-change
@@ -12217,7 +12563,7 @@ function rebuildEffectivePlanFields(
     }
   }
   for (const s of graph) {
-    if (eff(s.slug) === "EXECUTE") executeStages.push(s.number);
+    if (eff(s.slug) === "EXECUTE") executeStages.push(`${s.number} (${s.slug})`);
     else if (!preservedSlugs.has(s.slug)) skipStages.push(skipLabel(s));
   }
   let next = setField(content, "Stages to Execute", executeStages.join(", "));
@@ -12248,11 +12594,81 @@ function rebuildEffectivePlanFields(
   return { content: next, executeStages, completedCount };
 }
 
+// The stages this work's plan has skipped, as its own record holds them: the
+// plan picked at creation (WORKFLOW_STARTED) and every plan change since
+// (RECOMPOSED), the person's own and those they approved at a compose question.
+function stagesSkippedInThisWork(projectDir: string, intent?: string, space?: string): Set<string> {
+  const skipped = new Set<string>();
+  for (const row of readAuditShardEvents(projectDir, intent, space)) {
+    if (row.event !== "WORKFLOW_STARTED" && row.event !== "RECOMPOSED") continue;
+    for (const slug of (auditBlockField(row.block, "Stages skipped") ?? "").split(",").map((s) => s.trim())) {
+      if (slug !== "" && slug !== "none") skipped.add(slug);
+    }
+  }
+  return skipped;
+}
+
+// The plans that reopen this finished work, each with the stages it runs from
+// the one the scope change starts (stageReopenedByScopeChange decides whether
+// and where). Empty while the work runs. Recompose's refusal over finished work
+// and `next compose` there both name these, so the person hears the same way
+// on from either (#3207).
+export function plansReopeningFinishedWork(stateContent: string): Array<{ scope: string; stages: StageEntry[] }> {
+  const own = (getField(stateContent, "Scope") ?? "").trim();
+  const boxes = new Map(parseCheckboxes(stateContent).map((c) => [c.slug, c.state]));
+  const graph = loadStageGraph();
+  const mapping = loadScopeMapping();
+  return [...validScopes()].sort().flatMap((scope) => {
+    const first = scope === own ? null : stageReopenedByScopeChange(stateContent, scope);
+    if (first === null) return [];
+    const grid = scopeGridOnProject(mapping[scope], stateContent);
+    const stages = graph.slice(graph.findIndex((s) => s.slug === first.slug)).filter((s) =>
+      grid[s.slug] === "EXECUTE" && boxes.get(s.slug) !== "completed" && boxes.get(s.slug) !== "skipped");
+    return [{ scope, stages }];
+  });
+}
+
+// The skips typed beside a switch to `scope` on finished work that land before
+// its reopen picks a stage: each stage it would start, in turn, while the person
+// skipped it. Once a stage has started recompose can no longer skip it, so the
+// scope change takes these off the plan itself and starts the first stage after
+// them; `next` hands it these and every other typed skip to recompose.
+export function skipsBeforeReopen(stateContent: string, scope: string, skipped: readonly string[]): string[] {
+  const passed: string[] = [];
+  for (let at = stageReopenedByScopeChange(stateContent, scope); at !== null && skipped.includes(at.slug);
+    at = stageReopenedByScopeChange(stateContent, scope, passed)) {
+    passed.push(at.slug);
+  }
+  return passed;
+}
+
+// Recompose over finished work: its own plan takes no more stages, and a plan
+// that runs the ones asked for after the last stage reopens it there.
+function finishedWorkRecomposeRefusal(content: string, added: string[]): string {
+  const graph = loadStageGraph();
+  const name = (slug: string): string => graph.find((s) => s.slug === slug)?.name || slug;
+  const listed = (slugs: string[]): string => {
+    const names = slugs.map(name);
+    return names.length <= 1 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+  };
+  const last = name((getField(content, "Current Stage") ?? "").trim());
+  if (added.length === 0) return "Cannot recompose: this work is finished, so nothing on its plan is left to skip.";
+  const plans = plansReopeningFinishedWork(content)
+    .filter(({ stages }) => added.every((slug) => stages.some((s) => s.slug === slug)))
+    .map(({ scope }) => scope);
+  const typed = (args: string): string => `\`${entrySkillInvocation()} ${args}\``;
+  return plans.length > 0
+    ? `Cannot recompose: this work is finished, so its own plan takes no more stages. A plan that runs ${listed(added)} ` +
+      `after ${last} reopens it there, keeping what is done: ${plans.join(", ")}. To switch to one, type ${typed("--scope <plan>")}.`
+    : `Cannot recompose: this work is finished, so its own plan takes no more stages, and no plan runs ${listed(added)} ` +
+      `after ${last}. To run a stage on its own, type ${typed("--stage <stage> --single")}; for more, start new work.`;
+}
+
 function handleRecompose(projectDir: string, flags: Record<string, string>, rawArgs: readonly string[]): void {
   const usage = (message: string): never => die(
     `${message}\nUsage: recompose [--skip <slug,...>] [--add <slug,...>] ` +
     "[--sensors <on|off>] [--learnings <on|off>] [--summary-confirmation <on|off>] [--collaborators <on|off>] [--review <adversarial|advisory|none>] " +
-    "[--person-words <their words> | --person-words-file <file>] [--reason <text>] [--intent <slug>] [--space <name>] [--project-dir <path>] - repeat --skip/--add to list more stages.",
+    "[--message <id>] [--reason <text>] [--intent <slug>] [--space <name>] [--project-dir <path>] - repeat --skip/--add to list more stages.",
   );
   const flips = { skip: new Set<string>(), add: new Set<string>() };
   // Settings approved together with the stage changes land in the same state
@@ -12261,13 +12677,14 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
   const settings: IntentSettingsRequest = {};
   // Why the plan changed, when the engine knows (a jump to a skipped stage).
   let reason: string | undefined;
-  // The reply of theirs that approved the settings, as the agent names it: the
-  // setter proves it (settingTheirs) before it records them as theirs.
-  let personWords: string | undefined;
+  // The message of theirs that approved the settings, as the agent names it
+  // (--message): proved before the settings are recorded as theirs. Words from
+  // the form before it (--person-words, --person-words-file) are the agent's.
+  const named: Record<string, string> = {};
   const allowed = new Set<string>([
-    "skip", "add", "reason", "person-words", "person-words-file", "intent", "space", "project-dir", ...settingKeys,
+    "skip", "add", "reason", "message", "person-words", "person-words-file", "intent", "space", "project-dir",
+    ...settingKeys,
   ]);
-  let personWordsFile: string | undefined;
   // Preserve the original tokens before parseArgs collapses repeated flags,
   // including in-process CLI dispatch;
   // process.argv may still belong to the outer `aidlc engine` invocation.
@@ -12293,20 +12710,13 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
       for (const slug of slugs) flips[name].add(slug);
     } else if (name === "reason") {
       reason = value.trim();
-    } else if (name === "person-words") {
-      personWords = value;
-    } else if (name === "person-words-file") {
-      personWordsFile = value;
+    } else if (name === "message" || name === "person-words" || name === "person-words-file") {
+      named[name] = value;
     } else if (settingKeys.has(name as ConfigKey)) {
       settings[name as ConfigKey] = { value, source: "you" };
     }
   }
-  if (personWordsFile !== undefined) {
-    const read: Record<string, string> = { "person-words-file": personWordsFile };
-    if (personWords !== undefined) read["person-words"] = personWords;
-    readPersonWordsFile(projectDir, read);
-    personWords = read["person-words"];
-  }
+  const asked = setterMessage(projectDir, named, false, { request: Object.keys(settings).length === 0 });
   const skipList = [...flips.skip];
   const addList = [...flips.add];
   if (skipList.length === 0 && addList.length === 0) {
@@ -12329,19 +12739,17 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
   withAuditLock(projectDir, () => {
     let content = readStateFile(projectDir, flags.intent, flags.space);
     const before = content;
-    // AUTONOMY GUARD (mirrors the park guard's shape in aidlc-state.ts): an
-    // unattended autonomous Construction run has no human at the gate, so a
-    // conductor that drifts into "improving the plan" must not flip pending
-    // stages on its own. The SKILL.md prose says plan-reshape never runs under
-    // autonomous Construction on any harness; this is the deterministic anchor
-    // that enforcement was missing (the strict validator catches starvation and
-    // anchor moves, but not the absence of a human). Refuse outright; a
-    // legitimate unattended-recompose story, if one ever arrives, comes as an
-    // explicit flag, not the default.
-    if (getField(content, "Construction Autonomy Mode")?.trim() === "autonomous") {
+    // Under "Continue automatically" the person's own plan change goes through,
+    // as their scope change does (handleScopeChange), and the work keeps their
+    // autonomy choice. A change nobody asked for (an unattended driver, or a
+    // conductor that drifts into "improving the plan") is refused, naming the
+    // setter that lets it through.
+    if (isAutonomousMode(content) && !personAskedSinceGate(projectDir, { intent: flags.intent, space: flags.space })) {
+      const why = process.env.AIDLC_UNATTENDED === "1"
+        ? "with nobody here to approve it" : "without a request from the person for this change on record";
       die(
         "Cannot change the plan while Construction runs unattended (Construction Autonomy Mode is " +
-          "autonomous) with nobody here to approve it. Run " +
+          `autonomous) ${why}. Run ` +
           `\`${aidlcToolInvocation("bolt")} set-autonomy --mode gated\` (Construction then stops for ` +
           "approval at each Bolt), then recompose.",
       );
@@ -12352,8 +12760,9 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
     // leave no cursor to ever reach the added stage — a corrupted record,
     // not a plan change. (With no cursor, the behind-cursor guard below is
     // also inert, so this check is the only thing standing between recompose
-    // and a finished workflow.)
+    // and a finished workflow.) Finished work is told which plans reopen it.
     const wfStatus = getField(content, "Status") || "";
+    if (wfStatus.trim() === "Completed") die(finishedWorkRecomposeRefusal(content, addList));
     if (wfStatus !== "Running") {
       die(
         `Cannot recompose: workflow Status is "${wfStatus || "unknown"}", not Running. ` +
@@ -12386,11 +12795,16 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
       die(`Cannot recompose "${slug}": ${why}`);
     const typed = (args: string): string => `\`${entrySkillInvocation()} ${args}\``;
     const runAlone = (slug: string): string => `To run it on its own, type ${typed(`--stage ${slug} --single`)}.`;
-    const movePast = (slug: string): string => {
+    // A started stage (in progress, being revised, or at its own question) is
+    // skipped where it stands by the person's own skip, which `next` carries
+    // out (planChangeDirective); on the last stage that is the way on.
+    const movePast = (slug: string, started: boolean): string => {
       const next = nextInScopeStage(slug, scope, content);
       return next
         ? `To move past it, jump to the next stage with ${typed(`--stage ${next.slug}`)}.`
-        : "It is the last stage on the plan.";
+        : started
+          ? `It is the last stage on the plan; to skip it where it stands, type ${typed(`--skip ${slug}`)}.`
+          : "It is the last stage on the plan.";
     };
 
     for (const slug of [...skipList, ...addList]) {
@@ -12399,19 +12813,40 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
       }
       const skipping = skipList.includes(slug);
       const state = checkboxMap.get(slug);
-      if (state === "completed" || state === "in-progress" || state === "skipped" ||
+      // A stage the work skipped where it stood, added, goes back on the line
+      // not started (stageAddedBack) wherever the checks below say the work
+      // still reaches it; anywhere else it is refused as before.
+      const putBack = !skipping && stageSkippedWhereItStood(content, slug);
+      const frozen = `its checkbox is not pending ([${state}]), so the plan can no longer change it.`;
+      if (state === "completed" || state === "in-progress" || (state === "skipped" && !putBack) ||
           state === "awaiting-approval" || state === "revising") {
         const instead = state === "completed"
           ? `It is already done; to run it again, jump back to it with ${typed(`--stage ${slug}`)}.`
           : state === "skipped"
             ? (skipping ? "It is already skipped." : runAlone(slug))
-            : (skipping ? movePast(slug) : runAlone(slug));
-        reject(slug, `its checkbox is not pending ([${state}]), so the plan can no longer change it. ${instead}`);
+            : (skipping ? movePast(slug, true) : runAlone(slug));
+        reject(slug, `${frozen} ${instead}`);
       }
       const idx = graph.findIndex((s) => s.slug === slug);
-      if (currentIdx !== -1 && idx !== -1 && idx <= currentIdx) {
+      // Reverse Engineering owed behind the cursor is one `next` goes back to,
+      // so the plan still reaches it: a skip takes it off, and on existing code
+      // an add (the skip's undo) puts it back where `next` runs it.
+      const owedRe = slug === "reverse-engineering" &&
+        (skipping || declaredProjectType(getField(content, "Project Type") ?? "") === "Brownfield") &&
+        reverseEngineeringOwedBehindCursor(
+          skipping ? content : addList.reduce((probe, each) => stageAddedBack(probe, each), content),
+          recordDir(projectDir, flags.intent, flags.space));
+      // A stage the work has just passed over, while nothing after it has
+      // started, is one `next` goes back to (addedStagesPassedOver): the add
+      // lands as it would have before the approval that moved past it, and
+      // its undo takes it off again before `next` gets there.
+      const passedOver = skipping
+        ? addedStagesPassedOver(content, projectDir, flags.intent, flags.space).includes(slug)
+        : addReachesPassedOver(content, slug, recordDir(projectDir, flags.intent, flags.space), addList);
+      if (!owedRe && !passedOver && currentIdx !== -1 && idx !== -1 && idx <= currentIdx) {
+        if (putBack) reject(slug, `${frozen} ${runAlone(slug)}`);
         const instead = idx === currentIdx
-          ? (skipping ? movePast(slug) : runAlone(slug))
+          ? (skipping ? movePast(slug, false) : runAlone(slug))
           : (skipping ? "The workflow does not go back to it, so there is nothing to skip." : runAlone(slug));
         reject(slug, `it is ${idx === currentIdx ? "the current stage" : `behind the current stage ("${currentSlug}")`}, and a plan change only reaches stages ahead. ${instead}`);
       }
@@ -12474,6 +12909,12 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
         proposed[c.slug] = "EXECUTE";
       }
     }
+    // A stage this work skipped and the person now puts back (the undo, their
+    // own words later, a jump to it) is judged as the plan had it before the
+    // skip: what it reads that the plan leaves out is not new starvation. A
+    // stage the work never skipped is checked, alone or beside a put back.
+    const skippedHere = addList.length > 0 ? stagesSkippedInThisWork(projectDir, flags.intent, flags.space) : new Set();
+    for (const slug of addList) if (skippedHere.has(slug)) baseGrid[slug] = "EXECUTE";
     const projectType = (getField(content, "Project Type") || "").toLowerCase();
     const pt = projectType === "brownfield" || projectType === "greenfield"
       ? (projectType as "brownfield" | "greenfield")
@@ -12501,7 +12942,7 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
 
     // --- Apply the suffix flips ---------------------------------------------
     for (const slug of skipList) content = setStageSuffix(content, slug, "SKIP");
-    for (const slug of addList) content = setStageSuffix(content, slug, "EXECUTE");
+    for (const slug of addList) content = stageAddedBack(content, slug);
 
     // --- Rebuild the derived fields against the EFFECTIVE plan --------------
     const rebuilt = rebuildEffectivePlanFields(content, scope, scopeDef, currentSlug);
@@ -12511,7 +12952,7 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
     // The approved settings, applied to the recomposed content before the one write.
     const settingsUpdate = Object.keys(settings).length > 0
       ? applyIntentSettings(projectDir, content, settings, {
-          intent: flags.intent, space: flags.space, sessionId: readCurrentSessionId(projectDir), fail: die, personWords,
+          intent: flags.intent, space: flags.space, sessionId: readCurrentSessionId(projectDir), fail: die, ...asked,
         })
       : { content, audit: [], lines: [] };
     content = setField(settingsUpdate.content, "Last Updated", isoTimestamp());
@@ -12540,13 +12981,27 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
     }
 
     const droppedUnitWork = droppedUnitWorkLine(projectDir, before, content, flags.intent, flags.space);
+    // The person's approval at the in-flight compose question: its step runs
+    // this before deleting the question's marker and names nothing after it,
+    // so the work goes on from here, as after their approval at a stage's gate.
+    // The engine's other plan-change steps say what comes after themselves.
+    let approvedAtCompose = false;
+    try {
+      approvedAtCompose = composeGateOpen(projectDir);
+    } catch {
+      // An unreadable marker names no step; the plan change itself has landed.
+    }
     process.stdout.write(
       `Recomposed: ${skipList.length} skipped (${skipList.join(", ") || "none"}), ` +
         `${addList.length} added (${addList.join(", ") || "none"})\n` +
         `Stages in scope: ${executeStages.length}\n` +
         `Completed: ${completedCount}/${executeStages.length}\n` +
         (droppedUnitWork === null ? "" : `${droppedUnitWork}\n`) +
-        settingsUpdate.lines.map((line) => `${line}\n`).join(""),
+        settingsUpdate.lines.map((line) => `${line}\n`).join("") +
+        (approvedAtCompose
+          ? "Then delete `aidlc/.aidlc-compose-pending`, apply any setting the same approval also named, and run " +
+            `\`${aidlcToolInvocation("orchestrate")} next\`; follow what it returns, so the work carries on.\n`
+          : ""),
     );
   }, undefined, undefined, WORKSPACE_MUTATION_LOCK_RETRIES);
 }
@@ -12562,9 +13017,12 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
 // runs, its depth, Guard Policy, the ceremony settings and its review
 // level. The record goes to aidlc/scopes/ and compile projects it, so
 // `--scope <name>` works at once. The running work is left as it is.
+// `intent create --save-as <name>` runs the same save on the work it creates.
 
-const SAVED_SCOPE_NAME = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
-const SAVED_SCOPE_NAME_MAX = 40;
+function scopeNameTaken(name: string): boolean {
+  return Object.hasOwn(loadScopeMetadataAll(), name) || Object.hasOwn(loadScopeGrid(), name) ||
+    Object.hasOwn(loadComposedScopeRecords(), name);
+}
 
 function handleScopeSave(projectDir: string, flags: Record<string, string>, rawArgs: readonly string[]): void {
   const usage = (message: string): never =>
@@ -12577,12 +13035,8 @@ function handleScopeSave(projectDir: string, flags: Record<string, string>, rawA
   }
   const name = (flags.name ?? "").trim();
   if (name === "" || name === "true") usage("scope-save requires --name <name>.");
-  if (!SAVED_SCOPE_NAME.test(name) || name.length > SAVED_SCOPE_NAME_MAX) {
-    die(
-      `"${name}" cannot name a scope: use lowercase letters, digits, and single hyphens, ` +
-        `starting with a letter, at most ${SAVED_SCOPE_NAME_MAX} characters (for example quick-fix).`,
-    );
-  }
+  const refusal = savedScopeNameRefusal(name);
+  if (refusal !== null) die(refusal);
   // Keywords make the saved scope inferable from a request's words, so each
   // is one plain word (one another plan already has is noted under the lock
   // below).
@@ -12591,19 +13045,27 @@ function handleScopeSave(projectDir: string, flags: Record<string, string>, rawA
   if (badKeyword !== undefined) {
     die(`"${badKeyword}" cannot be a keyword: use one word of letters, digits, and hyphens, at most 40 characters.`);
   }
-  const sp = stateFilePath(projectDir, flags.intent, flags.space);
+  saveRunningPlan(projectDir, name, keywords, flags.intent, flags.space);
+}
+
+function saveRunningPlan(
+  projectDir: string,
+  name: string,
+  keywords: string[],
+  intent: string | undefined,
+  space: string | undefined,
+  failNote = "",
+): void {
+  const sp = stateFilePath(projectDir, intent, space);
   if (!existsSync(sp)) die("No state file found. scope-save keeps a running piece of work's plan; start one first.");
 
   withAuditLock(projectDir, () => {
-    const content = readStateFile(projectDir, flags.intent, flags.space);
+    const content = readStateFile(projectDir, intent, space);
     const scope = getField(content, "Scope");
     if (!scope) die("Cannot read current Scope from state file.");
     const scopeDef = loadScopeMapping()[scope];
     if (!scopeDef) die(`Unknown scope in state file: ${scope}.`);
-    const taken =
-      Object.hasOwn(loadScopeMetadataAll(), name) || Object.hasOwn(loadScopeGrid(), name) ||
-      Object.hasOwn(loadComposedScopeRecords(), name);
-    if (taken) die(`A scope named ${name} already exists. Pick another name.`);
+    if (scopeNameTaken(name)) die(`A scope named ${name} already exists. Pick another name.`);
     // A hint another plan already has is saved as asked and said once.
     const sharedHints = keywordCollisions(keywords);
 
@@ -12669,9 +13131,9 @@ function handleScopeSave(projectDir: string, flags: Record<string, string>, rawA
           Scope: scope,
           "Saved as": name,
           "Stages in Scope": String(executing),
-        }, flags.intent, flags.space));
+        }, intent, space));
     } catch (error) {
-      die(`Cannot save the scope: ${errorMessage(error)}`);
+      die(`Cannot save the scope: ${errorMessage(error)}${failNote}`);
     }
     const settings = [
       `sensors ${ceremony.sensors}`,
@@ -12771,8 +13233,36 @@ function readPersonWordsFile(projectDir: string, flags: Record<string, string>, 
   }
 }
 
+// The message the agent named as the one the person asked in (--message),
+// proved by the message proof's request form: the setting is then theirs
+// (settingTheirs) and a lowering stands on it. A message that already gave an
+// approval or another decision does not also stand for a setting (messageReach);
+// `request` is a caller that changes no setting (what the folder is, or a scope
+// or stage change that carries none), proved as any request is. A message that
+// does not prove refuses with the proof's own words. Words passed the way from
+// before --message (--person-words, --person-words-file) are the agent's own
+// text: kept as such, proving nothing.
+function setterMessage(
+  projectDir: string,
+  flags: Record<string, string>,
+  unreadableIsNone = false,
+  { newWork = false, request = false } = {},
+): { message?: StoredMessage; agentText?: string } {
+  readPersonWordsFile(projectDir, flags, unreadableIsNone);
+  const words = flags["person-words"];
+  const agentText = words === undefined || words === "true" ? undefined : words.replace(/\s+/g, " ").trim() || undefined;
+  if (flags.message === undefined) return { agentText };
+  // New work's own plan approval leaves the plan question that waits now as it is.
+  const planApprovalOff = !newWork && Object.entries(flags).some(([key, value]) => turnsPlanApprovalOff(key, value));
+  const lowers = Object.entries(flags).some(([key, value]) => turnsPersonsCheckOff(key, value));
+  const proof = proveMessage(projectDir, flags.message, request ? "request" : "setting", { request: true, planApprovalOff, lowers });
+  if ("refusal" in proof) die(proof.refusal);
+  return { message: proof.message, agentText };
+}
+
+
 function handleConfigChange(projectDir: string, flags: Record<string, string>): void {
-  readPersonWordsFile(projectDir, flags);
+  const named = setterMessage(projectDir, flags);
   const selection = resolveWorkflowSelection(projectDir, { intent: flags.intent, space: flags.space });
   const intent = selection.intent ?? undefined;
   const space = selection.space;
@@ -12785,16 +13275,30 @@ function handleConfigChange(projectDir: string, flags: Record<string, string>): 
     if (!selection.sessionId || flags.intent !== undefined || selection.intent !== null) die(NO_STATE_FILE_MESSAGE);
     const lines = keepSettingsForNextWork(
       projectDir, selection.sessionId, intentSettingsFromFlags(flags), space, die,
-      workToPickUp(projectDir, space, null) !== null, flags["person-words"],
+      workToPickUp(projectDir, space, null) !== null, named.message,
     );
     process.stdout.write(`${lines.join("\n")}\n`);
     return;
   }
-  const lines = writeSettings(projectDir, intent, space, intentSettingsFromFlags(flags), {
-    sessionId: selection.sessionId, fail: die, personWords: flags["person-words"],
+  const { lines, checkOffInTheirName } = writeSettings(projectDir, intent, space, intentSettingsFromFlags(flags), {
+    sessionId: selection.sessionId, fail: die, ...named,
   });
-  process.stdout.write(`${lines.join("\n")}\n`);
+  // Only the agent reads this output, and on Copilot, Cursor and Kiro no hook
+  // line reaches the person, so a check of theirs switched off from the chat is
+  // said by the agent or not at all; the order says the lines are theirs. A step
+  // of the engine's that has the agent print the output as it is passes
+  // --verbatim, so the person never reads the order. Codex and opencode draw
+  // this output's first lines in their tool panel, so where the host hands the
+  // model a note the person does not see, the order rides it with the lines
+  // (leaveSayOnceNote) and the output is the lines alone.
+  const due = checkOffInTheirName && flags.verbatim !== "true";
+  const said = due && !leaveSayOnceNote(projectDir, selection.sessionId, [SAY_SETTER_LINES, ...lines].join("\n"))
+    ? [SAY_SETTER_LINES]
+    : [];
+  process.stdout.write(`${[...said, ...lines].join("\n")}\n`);
 }
+
+const SAY_SETTER_LINES = "Say this to the person once, word for word:";
 
 // The setter's one transaction on a piece of work: the settings applied, their
 // audit rows, the state written, and the step in hand kept; its lines returned.
@@ -12805,15 +13309,16 @@ function writeSettings(
   request: IntentSettingsRequest,
   options: {
     sessionId: string | null; fail?: (message: string) => never; typedByPerson?: boolean;
-    personWords?: string; notTheirs?: ReadonlySet<string>;
+    message?: StoredMessage; agentText?: string; notTheirs?: ReadonlySet<string>;
   },
-): string[] {
+): { lines: string[]; checkOffInTheirName: boolean } {
   let lines: string[] = [];
+  let checkOffInTheirName = false;
   withAuditLock(projectDir, () => {
     const content = readConfigState(projectDir, { intent, space });
     const update = applyIntentSettings(projectDir, content, request, {
       intent, space, sessionId: options.sessionId, typedByPerson: options.typedByPerson,
-      personWords: options.personWords, notTheirs: options.notTheirs,
+      message: options.message, agentText: options.agentText, notTheirs: options.notTheirs,
       ...(options.fail ? { fail: options.fail } : {}),
     });
     if (update.content !== content) {
@@ -12832,8 +13337,9 @@ function writeSettings(
       }
     }
     lines = update.lines;
+    checkOffInTheirName = update.checkOffInTheirName;
   }, intent, space);
-  return lines;
+  return { lines, checkOffInTheirName };
 }
 
 // What this chat kept for the work it picks up or starts next goes to the work
@@ -12849,7 +13355,7 @@ function applyKeptToPickedWork(projectDir: string, sessionId: string, space: str
   try {
     lines = writeSettings(projectDir, intent, space, kept, {
       sessionId, typedByPerson: true, notTheirs: keptSettingsNotTheirs(projectDir, sessionId),
-    });
+    }).lines;
   } catch (e) {
     lines = [errorMessage(e)];
   }
@@ -13288,7 +13794,7 @@ export async function main(argv: string[]): Promise<void> {
   ) {
     process.stdout.write(
       "Usage: aidlc-utility intent-create --scope <scope> " +
-        '[--arguments "<description>" | --request <id>] [--label "<short label>"] ' +
+        "[--arguments '<description>' | --request <id>] [--label '<short label>'] " +
         "[--depth <level>] [--test-strategy <level>] [--review <class>] [--guard-policy <value>] " +
         "[--sensors <on|off>] [--learnings <on|off>] [--summary-confirmation <on|off>] [--collaborators <on|off>] " +
         "[--skip <slug,...>] [--add <slug,...>] [--repos <name,...>] [--project-type <greenfield|brownfield>] " +
@@ -13419,6 +13925,8 @@ export async function main(argv: string[]): Promise<void> {
       handleReclassify(projectDir, flags, rawArgs);
       break;
     case "select-plugins":
+      // The install the person names changes, as `plugin sync` reads it.
+      if (flags["harness-dir"]) pinNamedHarness(projectDir, flags["harness-dir"]);
       handleSelectPlugins(projectDir, positional);
       break;
     case "plugin-list":
@@ -13432,6 +13940,9 @@ export async function main(argv: string[]): Promise<void> {
       break;
     case "plugin-build":
       handlePluginBuild(positional, flags, missingValueFlags);
+      break;
+    case "plugin-test":
+      handlePluginTest(positional, flags, missingValueFlags);
       break;
     // init / state-init are transition-only and intentionally absent from help.
     // Stale init callers get a loud error for this release; workflow start is

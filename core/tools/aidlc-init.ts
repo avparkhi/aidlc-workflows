@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { LONG_SUBPROCESS_TIMEOUT_MS } from "./aidlc-runtime-budget.ts";
+import { proveMessage } from "./aidlc-message-store.ts";
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
@@ -120,6 +121,7 @@ import {
   TransactionFilesystemError,
   assertTransactionFilesystem,
   executePlan,
+  transactionCarries,
   transactionSourceHash,
   transactionState,
   validateTransactionPlan,
@@ -137,6 +139,7 @@ import {
   _resetStageGraphForTests,
   activeSpace,
   activeWorkflowDescriptions,
+  CEREMONY_ENV,
   commandAtPersonsTerminal,
   composedPluginBase,
   DEFAULT_SPACE,
@@ -145,6 +148,7 @@ import {
   fileIdentity,
   guardSwitchRefusal,
   type GuardSwitch,
+  hasRealGitEntry,
   normalizeProjectFlagsRecord,
   personAskedForThisLowering,
   RECORDABLE_PROJECT_BYPASSES,
@@ -356,12 +360,14 @@ import {
   type CompletionShell,
   type ConfigOutstandingAction,
   type DiagnosticIssue,
+  type ModelsAnswerRecord,
   type ProjectChoicesRecord,
   type ProvidersRecord,
   type RuntimeRecord,
   type TrustRecord,
 } from "./aidlc-config-diagnostics.ts";
 import { committedRecordIgnoreConflicts } from "./aidlc-gitignore.ts";
+import { deepFolder } from "./aidlc-folder-depth.ts";
 import {
   LOCAL_SETTINGS_FILE,
   invalidateSettingsCache,
@@ -466,8 +472,10 @@ type ModelsMutationContext = {
   summaryLines: string[];
   notes: string[];
   // Absent when the recorded policy is unchanged: a repair of the kiro-ide
-  // agent files that lost what the policy applies.
+  // agent files that lost what the policy applies, or the models answer alone.
   settings?: SettingsMutation;
+  // The models answer in harness.json, recorded or cleared with the policy.
+  overrides?: ConfigDiagnosticOverrides;
 };
 
 type DiagnosticSection = "runtime" | "providers" | "trust";
@@ -512,6 +520,10 @@ type ChoicesMutationContext = {
   settings?: SettingsMutation;
   /** A no-layer clear's other layers that also record the bypass. */
   extraSettings?: SettingsMutation[];
+  /** The id `--message` named: the message the person asked in. */
+  message?: string;
+  /** The switches `--clear-bypass` named. */
+  clears?: string[];
 };
 
 type SettingsMutation = {
@@ -557,12 +569,14 @@ const CONFIG_VALUE_FLAGS = new Set([
   "--hook-debug",
   "--bypass",
   "--clear-bypass",
+  "--message",
   "--writing-up-effort",
 ]);
 
 const CHOICE_VALUE_FLAGS = new Set([
   "--bypass",
   "--clear-bypass",
+  "--message",
   "--completions",
   "--default-scope",
   "--from",
@@ -642,6 +656,7 @@ const MODELS_BARE_FLAGS = new Set([
   "--help",
   "--global",
   "--json",
+  "--keep",
   "--local",
   "--no-color",
   "--project",
@@ -947,6 +962,7 @@ function validateModelsArgs(argv: readonly string[]): string | null {
     "--deciding-effort",
     "--effort",
     "--from",
+    "--keep",
     "--model",
     "--preset",
     "--reset",
@@ -958,6 +974,10 @@ function validateModelsArgs(argv: readonly string[]): string | null {
   const modes = validateConfigMutationModes(argv, "models", mutationFlags) ??
     validateSettingsTargets(argv);
   if (modes) return modes;
+  const withKeep = argv.includes("--keep")
+    ? mutationFlags.find((flag) => flag !== "--keep" && argv.includes(flag))
+    : undefined;
+  if (withKeep) return `--keep cannot be combined with ${withKeep}`;
   if (argv.includes("--preset") && argv.includes("--from")) {
     return "--preset and --from are mutually exclusive";
   }
@@ -1138,6 +1158,7 @@ function modelPolicyHelp(): string {
     "  --writing-up-effort <low|medium|high|xhigh|max>",
     "  --agent <name> [--effort <value>] [--model <raw-id>]  (one or both)",
     "  --agent <name> --effort default | --model default   remove that agent's own setting, so the preset or group applies again",
+    "  --keep    keep the models as they are and record that answer, so setup stops asking",
     "  --reset",
     "",
     heading("KIRO CLI", out),
@@ -1524,7 +1545,7 @@ function modelsWizard(
   harness: ModelHarness,
   projectDir: string,
   resolved: ResolvedAidlcSettings,
-): ModelPolicyRecord | null {
+): ModelPolicyRecord | null | undefined {
   showModels(current, tiers, harness, projectDir, resolved, {
     mode: "human",
     color: false,
@@ -1535,9 +1556,12 @@ function modelsWizard(
   writeMenuText(
     "Pins bind in both directions, and shipped tiers never raise an agent above the session.\n",
   );
-  const choice = configPrompt(
+  const answer = configPrompt(
     "Models [Enter keep everything, 1 preset, 2 group efforts, 3 set each one myself]:",
-  )?.trim();
+  );
+  // Closed input is no answer (undefined), so it records no kept answer.
+  if (answer === null) return undefined;
+  const choice = answer.trim();
   if (!choice) return current;
   if (choice === "1") {
     writeMenuText(
@@ -2927,10 +2951,13 @@ function setupMapRows(
     providerAnswerIsTheSession(modelHarness(distribution));
   const providerNeeds = providerManaged && !sessionAccess &&
     (providers.length > 0 || records.providers === null);
-  const modelsUnrecorded = !sessionSet && (!policy || modelPolicyIsEmpty(policy));
+  const noPolicy = !policy || modelPolicyIsEmpty(policy);
+  const modelsUnrecorded = !sessionSet && noPolicy && !records.modelsAnswer;
   const modelDetail = sessionSet
     ? sessionModelsDetail(modelHarness(distribution), policy)
-    : !policy || modelPolicyIsEmpty(policy)
+    : noPolicy && records.modelsAnswer
+    ? "agents inherit your session model and effort (your answer)"
+    : noPolicy
     ? "no recorded policy; agents inherit your session model and effort"
     : policy.preset
     ? `preset ${policy.preset}`
@@ -3132,13 +3159,19 @@ function setupLedgerActions(
   actions: readonly ConfigOutstandingAction[],
 ): ConfigOutstandingAction[] {
   const next = [...actions];
+  let records: ConfigDiagnosticRecords | null = null;
+  try {
+    records = readConfigDiagnosticRecords(join(projectDir, harnessDir));
+  } catch {
+    // The shared outstanding-action collector already reports unreadable data.
+  }
   if (
     !presetsChangeNothing(harness) &&
     !next.some((action) => action.section === "models")
   ) {
     const resolved = resolveAidlcSettings(projectDir);
     const policy = modelPolicyForHarness(resolved.models, harness);
-    if (!policy || modelPolicyIsEmpty(policy)) {
+    if ((!policy || modelPolicyIsEmpty(policy)) && !records?.modelsAnswer) {
       next.push({
         section: "models",
         id: "models-policy-unrecorded",
@@ -3150,23 +3183,16 @@ function setupLedgerActions(
     }
   }
   if (next.some((action) => action.section === "providers")) return next;
-  try {
-    const record = readConfigDiagnosticRecords(
-      join(projectDir, harnessDir),
-    ).providers;
-    // Only chase a missing answer where AI-DLC configures the model provider.
-    // Asking a subscription-harness user to "choose and configure a model
-    // provider" is a instruction they cannot complete and never needed.
-    if (record === null && !harnessOwnsModelAccess(harness) && !providerAnswerIsTheSession(harness)) {
-      next.push({
-        section: "providers",
-        id: "provider-record-missing",
-        message: "Choose and configure a model provider, then record the completed setup.",
-        command: configCommandForHarness(harnessDir, "providers"),
-      });
-    }
-  } catch {
-    // The shared outstanding-action collector already reports unreadable data.
+  // Only chase a missing answer where AI-DLC configures the model provider.
+  // Asking a subscription-harness user to "choose and configure a model
+  // provider" is a instruction they cannot complete and never needed.
+  if (records?.providers === null && !harnessOwnsModelAccess(harness) && !providerAnswerIsTheSession(harness)) {
+    next.push({
+      section: "providers",
+      id: "provider-record-missing",
+      message: "Choose and configure a model provider, then record the completed setup.",
+      command: configCommandForHarness(harnessDir, "providers"),
+    });
   }
   return next;
 }
@@ -3456,6 +3482,7 @@ function validateChoiceArgs(
         "--default-scope",
         "--harness",
         "--hook-debug",
+        "--message",
         "--plan-token",
         "--project-dir",
         "--sensor-timeout-ms",
@@ -3495,9 +3522,9 @@ function validateChoiceArgs(
   }
   // A check the person relies on is switched off for the project only when they
   // asked, by the rule every lowering follows (personAskedForThisLowering): from
-  // a chat, a turn of theirs since the last decision, or before any work their
-  // message there. A command no chat is named for (a script, a test) records as
-  // before.
+  // a chat, the message they asked in (--message), proved; a message that does
+  // not prove refuses with the proof's own words. A command no chat is named for
+  // (a script, a test) records as before.
   const lowered = section === "flags"
     ? valuesAfter(argv, "--bypass").find((name): name is RecordableProjectBypass =>
       (PERSON_CHECK_SWITCHES as readonly string[]).includes(name))
@@ -3510,8 +3537,14 @@ function validateChoiceArgs(
     } catch {
       chat = null;
     }
-    if (chat !== null && !personAskedForThisLowering(projectDir, chat) && !fenceKeyBypassed(projectDir, chat)) {
-      return guardSwitchRefusal(bypassedCheck(lowered), projectDir);
+    if (chat !== null) {
+      const named = valuesAfter(argv, "--message").at(-1);
+      const planApprovalOff = valuesAfter(argv, "--bypass").includes(CEREMONY_ENV.plan_approval);
+      const proof = named === undefined ? null : proveMessage(projectDir, named, "setting", { request: true, planApprovalOff, lowers: true });
+      if (proof !== null && "refusal" in proof) return proof.refusal;
+      if (!personAskedForThisLowering(proof?.message) && !fenceKeyBypassed(projectDir, chat)) {
+        return guardSwitchRefusal(bypassedCheck(lowered), projectDir);
+      }
     }
   }
   const mutationFlags = section === "flags"
@@ -4227,7 +4260,11 @@ function prepareChoiceSection(
     if (canonical(targetCurrentSettings) === canonical(nextSettings)) {
       // A check the person asked to turn off that is already off there: they
       // hear that, with the one wider place, instead of a note about the file.
-      const already = alreadyOffLines(projectDir, target, valuesAfter(argv, "--bypass"));
+      // One they asked back on that another file keeps off: that file.
+      const already = [
+        ...alreadyOffLines(projectDir, target, valuesAfter(argv, "--bypass")),
+        ...stillRecordedAfter(projectDir, [], undefined, valuesAfter(argv, "--clear-bypass")),
+      ];
       emitResult(success(already.length > 0 ? already.join("\n") : "flags configuration unchanged"), options);
       return null;
     }
@@ -4302,6 +4339,8 @@ function prepareChoiceSection(
       notes: summary.notes,
       ...(settings ? { settings } : {}),
       ...(extraSettings.length > 0 ? { extraSettings } : {}),
+      ...(valuesAfter(argv, "--message").length > 0 ? { message: valuesAfter(argv, "--message").at(-1) } : {}),
+      ...(valuesAfter(argv, "--clear-bypass").length > 0 ? { clears: valuesAfter(argv, "--clear-bypass") } : {}),
     },
   };
 }
@@ -6833,7 +6872,7 @@ function prepareRefreshSource(
   }
   delete staged.models;
   delete staged.flags;
-  for (const key of ["runtime", "providers", "trust", "project"] as const) {
+  for (const key of ["runtime", "providers", "trust", "project", "modelsAnswer"] as const) {
     if (!diagnosticsOverride || !Object.hasOwn(diagnosticsOverride, key)) continue;
     const value = diagnosticsOverride[key];
     if (value === null) delete staged[key];
@@ -7544,6 +7583,12 @@ function installedSources(
       // The explicit root may be a parent of distributions.
     }
   }
+  // A copied project's own tool (a Bun projection) has no installed runtime to
+  // refresh from: a native install holds the native form of whatever release it
+  // has, whose hooks call `aidlc`, so taking it would move the project to that
+  // release and swap its hooks. The copy fetches its own release instead
+  // (troubleshooting, the "workspace shell ready" row).
+  if (aidlcInvocation() !== "aidlc" && projectedDispatcher() !== null) return dedupeSourceRoots(roots);
   let selectedVersionRuntimeFound = false;
   const active = activeVersion();
   if (active) {
@@ -7901,11 +7946,32 @@ class ProjectLinkError extends Error {
   }
 }
 
-function assertNoProjectLinks(projectDir: string, directory: string): void {
+// The files an install record names, or null when there is none to read.
+function recordedFiles(path: string): string[] | null {
+  try {
+    const record = readBaseline(path);
+    return record ? Object.keys(record.files) : null;
+  } catch {
+    return null;
+  }
+}
+
+// A git checkout of the person's own inside a folder AI-DLC manages (Claude
+// Code keeps its worktrees in .claude/worktrees/): a folder with a real .git
+// entry where AI-DLC keeps none of its files, as `aidlcHas` answers.
+function personsCheckout(path: string, aidlcHas: (path: string) => boolean): boolean {
+  return lstatSync(path).isDirectory() && hasRealGitEntry(path) && !aidlcHas(path);
+}
+
+function assertNoProjectLinks(
+  projectDir: string,
+  directory: string,
+  passedOver: (rel: string) => boolean,
+): void {
   const visit = (rel: string): void => {
     for (const entry of readdirSync(join(projectDir, rel)).sort()) {
       const child = `${rel}/${entry}`;
-      if (hostToolPath(child)) continue;
+      if (passedOver(child)) continue;
       const stat = lstatSync(join(projectDir, child));
       if (stat.isDirectory()) visit(child);
       else if (!stat.isFile()) throw new ProjectLinkError(child, stat.isSymbolicLink());
@@ -7967,13 +8033,20 @@ function copiedProjectSource(
   validateProjectionDescriptor(projectDir, stamp, descriptor, {
     allowMissingRootIntegrations: true,
   });
+  // AI-DLC's own files are the ones the install record names; with no record
+  // to read, every checkout is read as it was.
+  const recorded = recordedFiles(join(dataDir, "aidlc-manifest.json"));
+  const passedOver = (rel: string): boolean =>
+    hostToolPath(rel) ||
+    (recorded !== null &&
+      personsCheckout(join(projectDir, rel), () => recorded.some((file) => file.startsWith(`${rel}/`))));
   for (const directory of descriptor.managedDirectories) {
     assertProjectionPathHasNoSymlinks(projectDir, directory);
     const source = join(projectDir, directory);
     if (!existsSync(source) || !lstatSync(source).isDirectory()) {
       throw new Error(`copied projection is missing managed directory ${directory}`);
     }
-    assertNoProjectLinks(projectDir, directory);
+    assertNoProjectLinks(projectDir, directory, passedOver);
   }
   const cleanup = mkdtempSync(join(tmpdir(), "aidlc-config-copy-source-"));
   try {
@@ -7982,12 +8055,13 @@ function copiedProjectSource(
   for (const directory of descriptor.managedDirectories) {
     const source = join(projectDir, directory);
     // What a host tool installed for itself (links in its node_modules
-    // included) is never release content, so it stays where it is and out of
-    // the source. Any other link was refused above.
+    // included) and the person's own checkouts are never release content, so
+    // they stay where they are and out of the source. Any other link was
+    // refused above.
     cpSync(source, join(root, directory), {
       recursive: true,
       preserveTimestamps: true,
-      filter: (path) => !hostToolPath(relative(projectDir, path).replaceAll("\\", "/")),
+      filter: (path) => !passedOver(relative(projectDir, path).replaceAll("\\", "/")),
     });
   }
   for (const integration of descriptor.rootIntegrations) {
@@ -8591,6 +8665,18 @@ function applyFirstRunChoices(
       "--yes",
       "--json",
     ], projectDir, snapshot);
+  } else if (!presetsChangeNothing(modelHarness(choices.candidate.stamp.distribution))) {
+    // "unchanged" is the person's models answer, so a refresh does not ask it again.
+    runConfigChild([
+      "models",
+      "--project-dir",
+      projectDir,
+      "--harness",
+      choices.candidate.stamp.distribution,
+      "--keep",
+      "--yes",
+      "--json",
+    ], projectDir, snapshot);
   }
   runConfigChild([
     "project",
@@ -8649,12 +8735,53 @@ function firstRunMutationPaths(
   ].map((path) => resolve(path)))];
 }
 
+// What the rollback snapshot goes around inside a folder AI-DLC manages: a
+// link or special file, and a git checkout of the person's own at a path the
+// release ships nothing to. Setup writes neither, and a transaction cannot
+// carry a link.
+function snapshotGoesAround(path: string, releaseHas: (path: string) => boolean): boolean {
+  return !transactionCarries(lstatSync(path)) || personsCheckout(path, releaseHas);
+}
+
+// The folder whole when nothing in it is gone around, as every stock project
+// is; else each entry beside what is gone around, split the same way, and the
+// folders that were split.
+function snapshotUnits(
+  path: string,
+  releaseHas: (path: string) => boolean,
+): { units: string[]; split: string[] } {
+  if (!pathPresent(path) || !lstatSync(path).isDirectory()) return { units: [path], split: [] };
+  const units: string[] = [];
+  const split: string[] = [];
+  let around = false;
+  for (const entry of readdirSync(path).sort()) {
+    const child = join(path, entry);
+    if (snapshotGoesAround(child, releaseHas)) {
+      around = true;
+      continue;
+    }
+    const inner = snapshotUnits(child, releaseHas);
+    if (inner.split.length > 0) around = true;
+    units.push(...inner.units);
+    split.push(...inner.split);
+  }
+  return around ? { units, split: [path, ...split] } : { units: [path], split: [] };
+}
+
 function snapshotFirstRunMutationPaths(
   projectDir: string,
   choices: FirstRunChoices,
 ): FirstRunMutationSnapshot {
   const root = mkdtempSync(join(tmpdir(), "aidlc-first-run-rollback-"));
-  const snapshots = firstRunMutationPaths(projectDir, choices).map((path, index) => {
+  const releaseHas = (path: string): boolean =>
+    pathPresent(join(choices.candidate.root, relative(projectDir, path)));
+  const split: string[] = [];
+  const paths = [...new Set(firstRunMutationPaths(projectDir, choices).flatMap((path) => {
+    const taken = snapshotUnits(path, releaseHas);
+    split.push(...taken.split);
+    return taken.units;
+  }))];
+  const snapshots = paths.map((path, index) => {
     const backup = join(root, String(index));
     return {
       path,
@@ -8693,6 +8820,25 @@ function snapshotFirstRunMutationPaths(
       };
     },
     recordCommitted: (result) => {
+      // What setup made beside an entry the snapshot went around is new, so a
+      // rollback removes it, as it removes a folder setup created.
+      for (const directory of split) {
+        for (const entry of readdirSync(directory).sort()) {
+          const path = join(directory, entry);
+          if (
+            split.includes(path) ||
+            snapshots.some((snapshot) => snapshot.path === path) ||
+            snapshotGoesAround(path, releaseHas)
+          ) continue;
+          snapshots.push({
+            path,
+            backup: join(root, String(snapshots.length)),
+            existed: false,
+            committed: transactionState(path),
+            owned: true,
+          });
+        }
+      }
       const data = result.data;
       if (!data || typeof data !== "object" || !("actions" in data)) return;
       const actions = (data as { actions?: unknown }).actions;
@@ -8898,6 +9044,13 @@ function renderFirstRunEnding(
   // record-hiding finding is read here, where the person looks.
   for (const warning of committedRecordIgnoreConflicts(projectDir)) {
     writeMenuRow("  Note: ", `${warning}.`);
+    process.stdout.write("\n");
+  }
+  const deep = deepFolder(projectDir, process.platform, undefined, {
+    harnesses: [choices.candidate.stamp.distribution],
+  });
+  if (deep) {
+    writeMenuRow("  Note: ", deep.note);
     process.stdout.write("\n");
   }
   const steps = choices.candidate.descriptor.firstRunSteps ??
@@ -10984,7 +11137,7 @@ function kiroModelsPlan(input: {
 function kiroModelsMenu(
   current: ModelPolicyRecord | null,
   kiro: FirstRunKiroSession | null,
-): "keep" | "session" | KiroPreset | "unchanged" {
+): "keep" | "session" | KiroPreset | "unchanged" | "closed" {
   const preset = isKiroPreset(current?.preset) ? current.preset : null;
   const model = kiro ? kiro.session.model : null;
   writeMenuRow(
@@ -11004,7 +11157,9 @@ function kiroModelsMenu(
       : "none recorded",
   );
   if (kiro && !model) writeMenuRow("  ", kiroAutoRecommendation(preset));
-  const choice = configPrompt("Models [Enter keep everything, 1 session model, 2 preset]:")?.trim();
+  const answer = configPrompt("Models [Enter keep everything, 1 session model, 2 preset]:");
+  if (answer === null) return "closed";
+  const choice = answer.trim();
   if (!choice) return "keep";
   if (choice === "1") return "session";
   if (choice !== "2") throw new Error("models selection cancelled");
@@ -11175,6 +11330,32 @@ function prepareModelsSection(
     );
     return null;
   }
+  // Enter at the models question, Kiro CLI's keep, first-run "unchanged" and
+  // --keep are one answer, recorded while no policy is so setup stops asking
+  // it. harness.json is not layered, so a --reset at any layer clears it.
+  // Either changes no agent, so neither asks to apply.
+  const answerRecorded = readConfigDiagnosticRecords(selected.root).modelsAnswer != null;
+  const modelsAnswerOnly = (modelsAnswer: ModelsAnswerRecord | null): PreparedModelsSection | null => {
+    if (modelsAnswer && (answerRecorded || presetsChangeNothing(harness) || !modelPolicyIsEmpty(current))) {
+      emitResult(success("model policy unchanged"), options);
+      return null;
+    }
+    return {
+      argv: modelsPipelineArgv(argv),
+      context: {
+        harness,
+        harnessDir: selected.harnessDir,
+        previous: current,
+        next: current,
+        tiers,
+        summaryLines: [],
+        notes: [],
+        overrides: { modelsAnswer },
+      },
+    };
+  };
+  const kept: ModelsAnswerRecord = { schemaVersion: 1, kept: true };
+  if (argv.includes("--keep")) return modelsAnswerOnly(kept);
 
   const kiroCli = selected.distribution === "kiro";
   // Kiro IDE's row takes a session model for Kiro CLI too, the model only.
@@ -11191,10 +11372,11 @@ function prepareModelsSection(
   if (kiroCli && !hasMutationFlags && configInputIsTty()) {
     const kiro = kiroSessionFor(selected.distribution);
     const pick = kiroModelsMenu(current, kiro);
-    if (pick === "keep" || pick === "unchanged") {
+    if (pick === "closed") {
       emitResult(success("model policy unchanged"), options);
       return null;
     }
+    if (pick === "keep" || pick === "unchanged") return modelsAnswerOnly(kept);
     if (pick === "session") {
       if (!kiro) {
         emitResult(
@@ -11255,7 +11437,7 @@ function prepareModelsSection(
   if (!hasMutationFlags && !configInputIsTty()) {
     emitResult(
       usage(
-        "non-interactive model configuration requires a policy flag: --preset, --from, a group effort flag, --agent, --session-model, or --reset; --yes confirms but never chooses a policy",
+        "non-interactive model configuration requires a policy flag: --preset, --from, a group effort flag, --agent, --session-model, --keep, or --reset; --yes confirms but never chooses a policy",
         configCommand("models --help"),
       ),
       options,
@@ -11273,7 +11455,7 @@ function prepareModelsSection(
   if (hasMutationFlags) {
     targetNext = applyModelsFlags(targetCurrent, argv, tiers, current);
   } else {
-    targetNext = modelsWizard(
+    const picked = modelsWizard(
       current,
       targetCurrent,
       tiers,
@@ -11281,6 +11463,11 @@ function prepareModelsSection(
       projectDir,
       resolved,
     );
+    if (picked === undefined) {
+      emitResult(success("model policy unchanged"), options);
+      return null;
+    }
+    targetNext = picked;
   }
   const targetModels = settingsModelsFromHarnessPolicy(
     targetCurrentSettings?.models ?? null,
@@ -11320,6 +11507,8 @@ function prepareModelsSection(
       }
       if (planned.plan) return { kiroOnly: planned.plan };
     }
+    if (argv.includes("--reset") && answerRecorded) return modelsAnswerOnly(null);
+    if (!hasMutationFlags) return modelsAnswerOnly(kept);
     emitResult(success("model policy unchanged"), options);
     return null;
   }
@@ -11386,6 +11575,7 @@ function prepareModelsSection(
           next: targetNextSettings,
         },
       }),
+      ...(argv.includes("--reset") && answerRecorded ? { overrides: { modelsAnswer: null } } : {}),
     },
   };
 }
@@ -11411,6 +11601,7 @@ function handleSettingsOnlySection(
     "--deciding-effort",
     "--effort",
     "--from",
+    "--keep",
     "--model",
     "--preset",
     "--reset",
@@ -11539,7 +11730,8 @@ function handleSettingsOnlySection(
       nextFile = updateSettingsSection(currentFile, "flags", nextFlags);
     }
     if (canonical(currentFile) === canonical(nextFile)) {
-      emitResult(success(`${section} configuration unchanged`), options);
+      const still = stillRecordedAfter(projectDir, [], undefined, valuesAfter(argv, "--clear-bypass"));
+      emitResult(success(still.length > 0 ? still.join("\n") : `${section} configuration unchanged`), options);
       return true;
     }
     const mutation: SettingsMutation = {
@@ -11588,12 +11780,14 @@ function handleSettingsOnlySection(
       if (note) notes.push(note);
     }
     for (const change of mutations) invalidateSettingsCache(change.path);
-    const changes = settingsChangeLines(projectDir, mutations);
+    const changes = settingsChangeLines(projectDir, mutations, undefined, valuesAfter(argv, "--clear-bypass"));
     // The lines above already name any other file that still records a
     // cleared switch.
     const switchLines = section === "flags"
       ? [...new Set(mutations.flatMap((change) =>
-        recordSwitchChange(projectDir, change.target, change.previous, change.next, { otherFiles: false })
+        recordSwitchChange(projectDir, change.target, change.previous, change.next, {
+          otherFiles: false, message: valuesAfter(argv, "--message").at(-1),
+        })
       ))]
       : [];
     if (options.mode === "human") {
@@ -11804,11 +11998,13 @@ function stillRecordedLines(projectDir: string, name: string, harness?: string):
 // What a settings change did, one line each, with the command that undoes it.
 // A setting that was not there before has no flag that removes it, so its undo
 // is the section's --reset, offered only when that resets nothing else the
-// file records; otherwise the line says it was not set there before.
+// file records; otherwise the line says it was not set there before. `clears`
+// holds the switches the command named with --clear-bypass.
 function settingsChangeLines(
   projectDir: string,
   mutations: readonly SettingsMutation[],
   harness?: string,
+  clears: readonly string[] = [],
 ): string[] {
   const fileOf = (target: SettingsTarget): string => settingsFileShown(projectDir, target);
   const command = (section: "flags" | "models", args: string[], target: SettingsTarget | null): string =>
@@ -11879,13 +12075,43 @@ function settingsChangeLines(
       }
     }
   }
-  // A clear aimed at one layer leaves the switch on where another records it.
+  lines.push(...stillRecordedAfter(projectDir, mutations, harness, clears));
+  return lines;
+}
+
+// The switches one settings change turned off or back on.
+function changedBypasses(change: SettingsMutation): string[] {
+  const before = new Set(change.previous?.flags?.bypasses ?? []);
+  const after = new Set(change.next?.flags?.bypasses ?? []);
+  return [...[...after].filter((name) => !before.has(name)), ...[...before].filter((name) => !after.has(name))];
+}
+
+// A clear aimed at one layer leaves the switch on where another records it:
+// one line for each such switch, with the command that clears it there. A
+// switch the command named counts even when the file it aimed at never
+// recorded it, so the file that does is named.
+function stillRecordedAfter(
+  projectDir: string,
+  mutations: readonly SettingsMutation[],
+  harness?: string,
+  clears: readonly string[] = [],
+): string[] {
   const cleared = mutations.flatMap((change) => {
     const after = new Set(change.next?.flags?.bypasses ?? []);
     return (change.previous?.flags?.bypasses ?? []).filter((name) => !after.has(name));
   });
-  for (const name of new Set(cleared)) lines.push(...stillRecordedLines(projectDir, name, harness));
-  return lines;
+  return [...new Set([...cleared, ...clears])].flatMap((name) => stillRecordedLines(projectDir, name, harness));
+}
+
+// The models answer recorded or cleared, with the command that undoes a record.
+function modelsAnswerLines(projectDir: string, context: ModelsMutationContext): string[] {
+  if (!context.overrides || !Object.hasOwn(context.overrides, "modelsAnswer")) return [];
+  const file = `${context.harnessDir}/tools/data/harness.json`;
+  return context.overrides.modelsAnswer
+    ? [`Recorded the models answer in ${file}. To undo: ${configInvocationFor(projectDir)} config models --reset --project --yes${
+      namedHarness(projectDir, context.harness)
+    }${projectTarget(projectDir)}`]
+    : [`Cleared the models answer in ${file}.`];
 }
 
 // What a harness.json answer changed, with the command that puts the earlier
@@ -11979,9 +12205,15 @@ function openWorkflowLine(
   const now = settingLeaves(after);
   const changed = [...new Set([...was.keys(), ...now.keys()])]
     .filter((id) => !id.startsWith("models.profiles.") && was.get(id)?.value !== now.get(id)?.value);
-  const bypasses = (file: AidlcSettingsFile | null | undefined): string =>
-    canonical([...(file?.flags?.bypasses ?? [])].sort());
-  const switched = bypasses(before) !== bypasses(after);
+  const wasOff = new Set<string>(before?.flags?.bypasses ?? []);
+  const nowOff = new Set<string>(after?.flags?.bypasses ?? []);
+  const switchedNames = [...new Set([...wasOff, ...nowOff])].filter((name) => wasOff.has(name) !== nowOff.has(name));
+  // A switch whose variable is in this command's environment is decided there
+  // (resolveProjectFlag), but open work reads the environment of the editor or
+  // CLI it runs in, which this command cannot see, so the line says nothing
+  // about open work when such a switch changed.
+  if (switchedNames.some((name) => Object.hasOwn(process.env, name))) return null;
+  const switched = switchedNames.length > 0;
   const rightAway = [
     ...(switched ? ["the switch"] : []),
     ...changed.flatMap((id) => RIGHT_AWAY_FLAGS.get(id) ?? []),
@@ -12233,21 +12465,25 @@ function afterProjectSettings(
 }
 
 // The switches a command that is ONLY `--clear-bypass` pairs names (plus
-// --yes, a layer, --project-dir and the output mode), and the layers it named.
-// Null for anything else, or a name that is not a switch, so the normal path
-// keeps its error and makes a change riding beside the clear.
+// --yes, a layer, --project-dir, the output mode, and what a clear does not
+// use: the --message the agent is handed for every typed message, and a
+// --harness the project has), and the layers it named. Null for anything
+// else, or a name that is not a switch, so the normal path keeps its error and
+// makes a change riding beside the clear.
 function clearOnlySwitches(
   argv: readonly string[],
   projectDir: string,
 ): { names: RecordableProjectBypass[]; layers: SettingsTarget[] } | null {
   const clears: string[] = [];
   const layers: SettingsTarget[] = [];
+  const harnesses: string[] = [];
   for (let index = 0; index < argv.length; index++) {
     const token = argv[index];
-    if (token === "--clear-bypass" || token === "--project-dir") {
+    if (token === "--clear-bypass" || token === "--project-dir" || token === "--message" || token === "--harness") {
       const value = argv[index + 1];
       if (value === undefined || value.startsWith("--")) return null;
       if (token === "--clear-bypass") clears.push(value);
+      if (token === "--harness") harnesses.push(value);
       index++;
       continue;
     }
@@ -12255,11 +12491,16 @@ function clearOnlySwitches(
       layers.push(token.slice(2) as SettingsTarget);
       continue;
     }
-    if (["--yes", "--json", "--quiet", "--no-color"].includes(token)) continue;
+    if (["--yes", "--json", "--quiet", "--no-color", "--verbose"].includes(token)) continue;
     return null;
   }
   if (clears.length === 0 || !settingsProjectAvailable(projectDir)) return null;
   if (!clears.every((name) => (RECORDABLE_PROJECT_BYPASSES as readonly string[]).includes(name))) return null;
+  try {
+    for (const harness of harnesses) selectedDiagnosticHarness(projectDir, harness, "flags");
+  } catch {
+    return null;
+  }
   return { names: clears as RecordableProjectBypass[], layers };
 }
 
@@ -12397,14 +12638,16 @@ function recordBypassesOnly(
     const notes = excludes.flatMap((exclude) => excludeLocalSettingsFromClone(exclude) ?? []);
     for (const change of mutations) invalidateSettingsCache(change.path);
     // What changed, the command that undoes it, and who picks it up.
-    const changes = settingsChangeLines(projectDir, mutations);
+    const changes = settingsChangeLines(projectDir, mutations, undefined, context.clears);
     const open = openWorkflowLine(projectDir, mutations);
     if (open) changes.push(open);
     // Which of the person's checks is now off or back on, in plain words.
     // The lines above already name any other file that still records a
     // cleared switch.
     const switchLines = [...new Set(mutations.flatMap((change) =>
-      recordSwitchChange(projectDir, change.target, change.previous, change.next, { otherFiles: false })
+      recordSwitchChange(projectDir, change.target, change.previous, change.next, {
+        otherFiles: false, message: context.message,
+      })
     ))];
     // With several harnesses and none named, no one harness's setup is the
     // person's to finish here.
@@ -12412,12 +12655,26 @@ function recordBypassesOnly(
       ? []
       : postApplyOutstandingActions(projectDir, context.harnessDir, context.harness);
     if (options.mode === "human") {
-      // The person sees what changed with its undo, and which check is now
-      // off or on again; anything more only when something still needs them.
-      writeMenuLines("", changes);
+      // The person sees which check is now off or on again and, where they
+      // need it, what changed with its undo; anything more only when
+      // something still needs them. From a chat, for their own file, the
+      // switch's own line already says what changed and the way back, and the
+      // agent turns the check back on when they ask, never handing them a
+      // command, so the file, its undo and the open workflows stay in the JSON
+      // result. A change to the project's shared file or the machine's keeps
+      // them (from a chat chatBackOnLines never clears either, so the file and
+      // its undo are the person's way back), and so does a switch with no line
+      // of its own. A switch another file still keeps off is said either way:
+      // its own line is left out of switchLines for that one.
+      const ownSwitchesOnly = mutations.every((change) => change.target === "local") &&
+        mutations.flatMap(changedBypasses).every((name) => (PERSON_CHECK_SWITCHES as readonly string[]).includes(name));
+      const shown = switchLines.length > 0 && !commandAtPersonsTerminal() && ownSwitchesOnly
+        ? stillRecordedAfter(projectDir, mutations, undefined, context.clears)
+        : changes;
+      writeMenuLines("", shown);
       writeMenuLines("", notes.map((note) => `Note: ${note}`));
       writeMenuLines("", switchLines);
-      if (changes.length + notes.length + switchLines.length === 0) {
+      if (shown.length + notes.length + switchLines.length === 0) {
         writeMenuLines("", [`configured flags settings for ${projectDir}`]);
       }
       if (outstandingActions.length > 0) {
@@ -13236,7 +13493,7 @@ export async function main(
             predatesFrameworkVersion(sibling.frameworkVersion, stamp.frameworkVersion)
           ) {
             throw new Error(
-              `harness ${stamp.distribution} shares ${integration.path} with installed ${sibling.distribution}, whose install predates shared onboarding; run aidlc config --harness ${sibling.distribution} first — if it still refuses afterwards, its ${integration.path} is exclusive and they cannot coexist in one project`,
+              `harness ${stamp.distribution} shares ${integration.path} with installed ${sibling.distribution}, whose install predates shared onboarding; run aidlc config --harness ${sibling.distribution} first - if it still refuses afterwards, its ${integration.path} is exclusive and they cannot coexist in one project`,
             );
           }
           throw new Error(
@@ -13278,7 +13535,7 @@ export async function main(
       projectedSettings.flags,
       recordOnly,
       Boolean(selected.projectProjection),
-      diagnosticsContext?.overrides ?? choicesContext?.overrides,
+      diagnosticsContext?.overrides ?? choicesContext?.overrides ?? modelsContext?.overrides,
       argv.includes("--force"),
     );
     prepared.notes.unshift(...sourceNotes);
@@ -13530,6 +13787,12 @@ export async function main(
         descriptor.rootIntegrations.some((integration) => integration.path === ".gitignore")
         ? committedRecordIgnoreConflicts(projectDir)
         : [];
+    // A Windows folder too deep for AI-DLC's records is named the same way, in
+    // one line; the folder stays where the person keeps it.
+    const deepProject = !choicesContext && !diagnosticsContext && !modelsContext
+      ? deepFolder(projectDir, process.platform, undefined, { harnesses: [stamp.distribution] })?.note
+      : undefined;
+    if (deepProject) prepared.notes.push(deepProject);
     // Kiro's v3 engine and Kiro IDE run every hook JSON file in the hooks
     // directory; the v2 engine the agent-v1 row runs on reads none. A switch to
     // a row that registers its hooks that way names each such file AI-DLC does
@@ -13612,7 +13875,12 @@ export async function main(
     // edit map AI-DLC writes into this project; the person hears it once here.
     const shortForm = stamp.distribution === "opencode" ? openCodeGlobalShortFormNote() : null;
     if (shortForm) prepared.notes.push(shortForm);
-    const quietWarnings = [...hiddenRecords, ...switchWarnings, ...(shortForm ? [shortForm] : [])];
+    const quietWarnings = [
+      ...hiddenRecords,
+      ...(deepProject ? [deepProject] : []),
+      ...switchWarnings,
+      ...(shortForm ? [shortForm] : []),
+    ];
     const withQuietWarnings = (message: string): string =>
       options.mode === "quiet" && quietWarnings.length > 0
         ? `${message}${quietWarnings.map((warning) => `\nWarning: ${warning}`).join("")}`
@@ -13906,6 +14174,7 @@ export async function main(
           choicesContext.settings.target,
           choicesContext.settings.previous,
           choicesContext.settings.next,
+          { message: choicesContext.message },
         )
       : [];
     if (modelsContext && options.mode === "human") {
@@ -13939,8 +14208,11 @@ export async function main(
     // What a recorded setting changed, the command that undoes it, and who
     // picks it up.
     const changes = [
-      ...(settingsMutation ? settingsChangeLines(projectDir, [settingsMutation], descriptor.distribution) : []),
+      ...(settingsMutation
+        ? settingsChangeLines(projectDir, [settingsMutation], descriptor.distribution, choicesContext?.clears)
+        : []),
       ...(diagnosticsContext ? recordChangeLines(projectDir, diagnosticsContext) : []),
+      ...(modelsContext ? modelsAnswerLines(projectDir, modelsContext) : []),
     ];
     // A model policy reaches running work only through the agent files it
     // rewrites; a harness whose agents inherit the session says so in a note.

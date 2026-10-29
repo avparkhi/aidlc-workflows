@@ -121,7 +121,7 @@ Security](19-supply-chain-security.md).
 
 ## Markdown structure
 
-Use `markdownBlocks` in `core/tools/aidlc-lib.ts` for block visibility,
+Use `markdownBlocks` in `core/tools/aidlc-markdown.ts` for block visibility,
 containers, link reference definitions, and claim splitting. It is backed by
 the built-in `Bun.markdown` renderer; its `visibleMarkdownLines` projection
 preserves consumer-specific visibility options. Do not add a Markdown
@@ -130,6 +130,20 @@ dependency, a hand-rolled block scanner, or a reference-definition grammar.
 do not fold that security boundary into the block adapter. See
 [Markdown structure](01-architecture.md#markdown-structure) for how the adapter
 recovers source lines from the renderer.
+
+## Where new tool code goes
+
+`core/tools/aidlc-lib.ts` takes no new code: a new function, type or constant
+goes in its area's module under `core/tools/` (an existing `aidlc-<area>.ts`, or
+a new one), never in `aidlc-lib.ts`. Code moves out of it one area at a time,
+byte for byte, and stays importable from it through one `export ... from` line,
+so nothing that imports `aidlc-lib.ts` changes; a module split out of it never
+imports `aidlc-lib.ts`. `tests/unit/t-aidlc-lib-only-shrinks.test.ts` fails on a
+name `aidlc-lib.ts` declares that is not on
+`tests/fixtures/aidlc-lib-declarations.txt`, and on a module it imports that
+imports it back (the ones that did before this rule are listed in the test); a
+move deletes its names from that list and lowers the file's size cap in
+`biome.json`, and neither is ever raised.
 
 ## Testing
 
@@ -244,9 +258,10 @@ The intent-configuration handlers share a single mutation path:
 | `aidlc engine config get <key>` | `config-get` | Read one of `depth`, `test-strategy`, `review`, `guard-policy`, `sensors`, `learnings`, `summary-confirmation`, `collaborators`, or one of the four `guard.<fence>` keys; the retired key `change-control` resolves to `guard-policy` |
 | `aidlc engine config list [--json]` | `config-list` | Read all thirteen settings in that order; Guard Policy, fence, and ceremony values include effective sources |
 | `aidlc engine config set <key> <value> [--key value ...]` | `config-change --<key> <value> ...` | Apply all supplied setting flags in one transaction; every key uses this route |
-| `aidlc engine scope change --scope <name> [--key value ...] [--person-words '<their words>']` | `scope-change --scope <name> ...` | Re-plan scope and apply any of the same twelve settings in the same transaction, including when the requested scope is already current |
+| `aidlc engine scope change --scope <name> [--key value ...] [--message <id>] [--skip <slug,...>]` | `scope-change --scope <name> ...` | Re-plan scope and apply any of the same twelve settings in the same transaction, including when the requested scope is already current; on finished work `--skip` takes off the plan the stages the switch would reopen it at |
 
-`config-change` accepts only the twelve setting flags plus `--intent`, `--space`,
+`config-change` accepts only the twelve setting flags plus `--message` (and the
+`--person-words` forms from before it, which prove nothing), `--intent`, `--space`,
 and `--project-dir`, and requires at least one setting. Reject unknown flags by
 name and validate all values before any mutation. A shared utility applier
 returns candidate content, `AuditEntryInput[]`, and output lines in canonical
@@ -264,7 +279,8 @@ Memory continues to control the effective value.
 Preserve state and event contracts: `review adversarial` stores an empty
 `Review Override`; explicit Guard Policy and ceremony values use `(set by you)`
 when `settingTheirs` finds the person behind them (a typed switch, their own
-terminal, or `--person-words` equal to a reply of theirs on record) and
+terminal, or the message of theirs the agent names with `--message <id>`, once
+`proveMessage` proves it) and
 `(set by a command)` otherwise, while inherited scope defaults retain scope provenance. A
 scope change preserves explicit overrides and absent legacy Guard
 Policy/ceremony rows. Only real stored field or source changes produce setting
@@ -384,7 +400,7 @@ A scope is authored as a file (its identity) plus a per-stage membership tag. Th
 
 5. **Verify `doctor` accepts it as an env default** — `AWS_AIDLC_DEFAULT_SCOPE=hotfix aidlc doctor` should report the env var as valid.
 
-6. **Check the plan's hints read well** (if `keywords` populated) - the engine no longer matches them; the agent reads them in the plan proposal step (`next "<a request your plan is for>" --project-dir /tmp/scope-smoke` prints every plan with its hints). Make sure the line for yours says what the plan is for in plain words.
+6. **Check the plan's hints read well** (if `keywords` populated) - the engine no longer matches them; the agent reads them in the plan proposal step (`next '<a request your plan is for>' --project-dir /tmp/scope-smoke` prints every plan with its hints). Make sure the line for yours says what the plan is for in plain words.
 
 7. **Verify plan parity (optional but recommended)** — `AIDLC_GRAPH_RESOLVE=1 aidlc engine graph resolve hotfix --stdout` emits the scope's plan; eyeball that the EXECUTE set matches what you tagged.
 

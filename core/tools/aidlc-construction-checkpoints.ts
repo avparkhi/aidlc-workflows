@@ -10,14 +10,18 @@ import { closeSync, existsSync, lstatSync, mkdtempSync, openSync, readSync, rmdi
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { appendAuditEntryUnlocked } from "./aidlc-audit.ts";
+import { proveMessage, readMessage } from "./aidlc-message-store.ts";
+import { askedQuestionFields, QUESTION_ID_FIELD, questionShows } from "./aidlc-questions.ts";
 import { aidlcToolInvocation } from "./aidlc-runtime-paths.ts";
-import { APPROVAL_GATE_CHOICES, protectedQuestionPick } from "./aidlc-reply-reader.ts";
+import { APPROVAL_GATE_CHOICES } from "./aidlc-reply-reader.ts";
 import {
   activeIntentUuid,
   attemptEventDefinitelyBefore,
   constructionSkeletonOn,
   auditBlockField,
   authorizedVerificationCommand,
+  markPersonLinesHeard,
+  addPendingPersonLines,
   verificationCommandRecovery,
   type VerificationCommand,
   claimAttemptFields,
@@ -39,26 +43,29 @@ import {
   consumeProtectedQuestion,
   withdrawProtectedQuestions,
   changeRequestWords,
+  personsWordsText,
+  protectedResponseFields,
   readProtectedResponse,
   requireProtectedResponse,
   protectedTargetDigest,
   gateWordsSinceUnitReview,
+  protectedReplyFloor,
+  isoTimestamp,
   markProtectedQuestionReplied,
   mintProtectedQuestion,
+  PROTECTED_RESPONSE_REPLIES_MAX,
   PROTECTED_RESPONSE_WORDS_MAX_CHARS,
   writeProtectedResponse,
   isAutonomousMode,
   constructionCheckpointsApply,
   isNonAnswer,
   latestMainWorkflowStageRunFloorForProject,
-  latestPersonTurn,
   leftOutLine,
   reviewCheckOffer,
   loadStageGraph,
   maximalAttemptEvents,
   personMayApproveOverUnfinishedReview,
   parseCheckboxes,
-  personSpokeSinceGate,
   readAuditShardEvents,
   readRegularFileNoFollowOrThrow,
   readStateFile,
@@ -77,8 +84,9 @@ import {
   reviewAttemptEventMatchesCurrentClaim,
   reviewAttemptWindow,
   reviewRequestBindingFromBlock,
-  selfAttributedDecisionMarker,
   setField,
+  sourceClaimCovers,
+  stateFilePath,
   sortAttemptEvents,
   sourceListingChangedPaths,
   stageJumpReaches,
@@ -103,6 +111,7 @@ import {
   rawFingerprintForm,
   committedTextSha256,
 } from "./aidlc-lib.ts";
+import { unheardBroughtFilesLine } from "./aidlc-brought-files.ts";
 import type { ApprovalDecider } from "./aidlc-review-brief.ts";
 
 
@@ -115,6 +124,13 @@ export type ApprovalFindingDispositions = (
   stages: readonly string[],
   units: readonly string[],
   decider: ApprovalDecider,
+) => Record<string, string>;
+
+// The fields a Request Changes row records for the review findings the person
+// rejected or reopened, from the same writer.
+export type RejectedFindingDispositions = (
+  stages: readonly string[],
+  units: readonly string[],
 ) => Record<string, string>;
 
 export function constructionCheckpointKind(
@@ -210,6 +226,9 @@ export interface ConstructionCheckpoint {
   /** From ask: what the person left out of this Unit's build, said once just
    *  before the question. */
   left_out?: string;
+  /** From ask: the files the person brought that this build changed or
+   *  deleted, with the way back, said once just before the question. */
+  changed_files?: string;
   /** From ask: the one check offered when a stage's review passes are spent
    *  and its reviewed work changed after the last review, said with
    *  `left_out` just before the question. */
@@ -574,6 +593,11 @@ interface Snapshot {
   /** The stages whose unfinished review the person let the Unit go on
    *  without, which its verification records. */
   waivedStages: string[];
+  /** The message the person said to go on without the review in, as the latest verification recorded it. */
+  waiverMessage: string | null;
+  /** Each source stage's files as an approval of the Unit holds them, however many, with the claim that reads
+   *  them as the Unit's whole listing when one does: a path it covers that they lack is one the Unit deleted. */
+  approvedFiles: Map<string, { files: WorkspaceSourceListing; claim?: SourceClaimModel }>;
 }
 
 interface ApprovedStageEvidence {
@@ -720,9 +744,18 @@ function fingerprintKeptOverScopeChange(
   return workKeptOverScopeChange(rows, first, last, unit, stages, current, floors) ? kept : null;
 }
 
+// The claim a kept listing was read under, when the listing is the approved
+// one: it reproduces the approved source fingerprint under the Unit's manifest.
+function approvedListingClaim(
+  recorded: ApprovedStageEvidence,
+  claimed: { model: SourceClaimModel; sha256: string } | null,
+): SourceClaimModel | null {
+  return recorded.files !== null && claimed !== null &&
+    unitSourceFingerprint(recorded.files, claimed.model, claimed.sha256) === recorded.source ? claimed.model : null;
+}
+
 // The one change an approved Unit's work made to a stage no review re-checks.
-// Its files are named only from a kept listing that is the approved one: the
-// listing reproduces the approved source fingerprint under the Unit's manifest.
+// Its files are named only from a kept listing that is the approved one.
 function approvedWorkChange(
   slug: string,
   unit: string,
@@ -735,9 +768,9 @@ function approvedWorkChange(
 ): AcceptedChange {
   const artifactMoved = recorded.artifact !== artifact;
   const sourceMoved = recorded.source !== source;
-  const paths = !artifactMoved && sourceMoved && recorded.files !== null && claimed !== null && listing !== null &&
-    unitSourceFingerprint(recorded.files, claimed.model, claimed.sha256) === recorded.source
-    ? sourceListingChangedPaths(recorded.files, restrictSourceListing(listing, claimed.model))
+  const claim = approvedListingClaim(recorded, claimed);
+  const paths = !artifactMoved && sourceMoved && claim !== null && listing !== null
+    ? sourceListingChangedPaths(recorded.files!, restrictSourceListing(listing, claim))
     : [];
   const pair = (artifactValue: string, sourceValue: string | null): string =>
     [artifactMoved ? artifactValue : null, sourceMoved ? sourceValue : null]
@@ -861,6 +894,7 @@ function snapshot(
   const recordedEvidence = askedEvidence ?? (gate?.event === "GATE_APPROVED" && auditBlockField(gate.block, "Unit") === unit
     ? readApprovedEvidence(gate.block) : null);
   const approvedEvidence: Record<string, [string | null, string | null] | [string | null, string, Record<string, string>]> = {};
+  const approvedFiles = new Map<string, { files: WorkspaceSourceListing; claim?: SourceClaimModel }>();
   const verification = onlyLatest(rows.filter((row) =>
     row.event === "CHECKPOINT_VERIFICATION_RECORDED" &&
     auditBlockField(row.block, "Unit") === unit &&
@@ -955,6 +989,7 @@ function snapshot(
     }
     const ownSource = source;
     let keptFiles: WorkspaceSourceListing | null = null;
+    let keptClaim: SourceClaimModel | null = null;
     const reviewClass = stage.reviewer
       ? resolveReviewClass(stage.review_class ?? "adversarial", scope, state)
       : "none";
@@ -1173,10 +1208,13 @@ function snapshot(
         artifact = recorded.artifact;
         source = recorded.source;
         keptFiles = recorded.files;
+        keptClaim = approvedListingClaim(recorded, claimed);
       }
     }
     const files = source === null ? null
       : source === ownSource && claimed && listing ? restrictSourceListing(listing, claimed.model) : keptFiles;
+    const claim = source === ownSource && claimed && listing ? claimed.model : keptClaim;
+    if (files !== null && source !== null) approvedFiles.set(slug, { files, ...(claim ? { claim } : {}) });
     approvedEvidence[slug] = files !== null && source !== null && files.size <= APPROVED_FILES_CAP
       ? [artifact, source, Object.fromEntries(files)]
       : [artifact, source];
@@ -1296,7 +1334,9 @@ function snapshot(
   const unfinishedStages = stages.filter((slug) => notFinished.includes(slug) || endedUnfinished.includes(slug));
   return {
     root, rows, state, verificationCommand: shared.verificationCommand, accepted,
+    waiverMessage: verification ? auditBlockField(verification.block, "Message Id") : null,
     approvedEvidence: JSON.stringify(approvedEvidence),
+    approvedFiles,
     overAllowed: rereview?.unfinished !== undefined && unfinishedMayGoOn && overAllowed(),
     waivedStages: notFinished,
     result: {
@@ -1328,6 +1368,40 @@ export function resolveConstructionCheckpoint(
   evidence?: ConstructionEvidence,
 ): ConstructionCheckpoint {
   return snapshot(projectDir, unit, kind, stateContent, evidence).result;
+}
+
+/**
+ * `listing` with the walking skeleton's files for `stage` laid over it, as the
+ * person approved them at its own checkpoint, the files it deleted gone: the
+ * swarm builds the Units after the skeleton, so its first landing starts from
+ * it. `listing` as it is without a current approval, for another intent than
+ * the active one, or when the evidence cannot be read. Without a claim that
+ * reads the approved files back (a manifest changed since), a file the
+ * skeleton deleted reads as before. Reads only; records nothing.
+ */
+export function afterApprovedSkeleton(
+  projectDir: string,
+  stage: string,
+  listing: WorkspaceSourceListing,
+  intent?: string,
+  space?: string,
+): WorkspaceSourceListing {
+  try {
+    if (stateFilePath(projectDir, intent, space) !== stateFilePath(projectDir)) return listing;
+    const state = readStateFile(projectDir);
+    if (!constructionSkeletonOn(state)) return listing;
+    const dag = resolveBoltDag(projectDir);
+    const skeleton = dag.state === "ok" ? dag.batches.flat()[0] : undefined;
+    if (skeleton === undefined) return listing;
+    const current = snapshot(projectDir, skeleton, "skeleton", state);
+    const approved = current.result.approved ? current.approvedFiles.get(stage) : undefined;
+    if (approved === undefined) return listing;
+    const { files, claim } = approved;
+    const outside = claim === undefined ? [...listing] : [...listing].filter(([key]) => !sourceClaimCovers(key, claim));
+    return new Map([...outside, ...files]);
+  } catch {
+    return listing;
+  }
 }
 
 /**
@@ -1383,8 +1457,9 @@ function requireReady(current: Snapshot): void {
         : ` The ${reviewsNamed([step.stage])} for ${result.unit} ` +
           `${step.unfinished === "no-verdict" ? "did not finish" : "is NOT-READY with a pass left"}. ` +
           (current.overAllowed
-            ? `If the person said to approve ${result.unit} as it is (their words since the last question), verify ` +
-              `with --over-unfinished-review; otherwise finish the review: ${finish}.`
+            ? `If the person said to approve ${result.unit} as it is, verify with --over-unfinished-review ` +
+              "--message <id>, the id of the message they said it in; " +
+              `otherwise finish the review: ${finish}.`
             : `Finish it first, without asking the person: ${finish}.`);
     throw new Error(`Construction checkpoint is not ready: ${result.errors.join(" ")}${rereview}`);
   }
@@ -1431,11 +1506,18 @@ export async function verifyConstructionCheckpoint(
   projectDir: string,
   unit: string,
   kind: ConstructionCheckpointKind,
-  options: { overUnfinishedReview?: boolean; timeoutMs?: number } = {},
+  options: { overUnfinishedReview?: boolean; timeoutMs?: number; message?: string } = {},
 ): Promise<ConstructionCheckpoint> {
+  // The person's "approve it as it is": the message the agent names
+  // (--message), proved, is what lets the Unit go on without its review.
+  let over: string | null = null;
+  if (options.overUnfinishedReview === true && options.message !== undefined) {
+    const proof = proveMessage(projectDir, options.message, "request", { request: true });
+    if ("refusal" in proof) throw new Error(proof.refusal);
+    over = proof.message.id;
+  }
   // A check that formats or regenerates the Unit's files changes what it
   // checked, so it runs once more against the files as they are now.
-  const over = options.overUnfinishedReview === true;
   const timeoutMs = verificationTimeoutMs(options.timeoutMs);
   const first = await verifyOnce(projectDir, unit, kind, false, over, timeoutMs);
   if (!first.rerun) return first.result;
@@ -1454,12 +1536,11 @@ async function verifyOnce(
   unit: string,
   kind: ConstructionCheckpointKind,
   secondRun: boolean,
-  overUnfinishedReview: boolean,
+  // The message the person said to approve it as it is in, proved; null when they said nothing of it now.
+  overUnfinishedReview: string | null,
   timeoutMs: number,
 ): Promise<{ result: ConstructionCheckpoint; rerun: boolean }> {
-  // The agent passes on the person's "approve it as it is"; their words since
-  // the last decision are what let the Unit go on without its review.
-  const personAllows = overUnfinishedReview && personSpokeSinceGate(projectDir, { requests: true });
+  const personAllows = overUnfinishedReview !== null;
   const before = locked(projectDir, () => {
     withdrawProtectedQuestions(projectDir, "*");
     const current = snapshot(projectDir, unit, kind, undefined, undefined, personAllows);
@@ -1556,6 +1637,8 @@ async function verifyOnce(
     proof.verified = passed && proof.error === null && proof.evidence_unchanged;
     writeRecordFileNoFollow(before.root, proofRelativePath(unit, kind), `${JSON.stringify(proof, null, 2)}\n`);
     if (after.root !== before.root) throw new Error("Active intent changed during Construction verification.");
+    // The waiver it records stands on the message the person said it in: named now, or carried from the last one.
+    const waiverMessage = overUnfinishedReview ?? before.waiverMessage;
     appendAuditEntryUnlocked("CHECKPOINT_VERIFICATION_RECORDED", {
       Unit: unit,
       Kind: kind,
@@ -1570,6 +1653,7 @@ async function verifyOnce(
       ...(before.waivedStages.length > 0 ? {
         "Review Not Finished": JSON.stringify(Object.fromEntries(before.waivedStages
           .map((stage) => [stage, before.result.run_floors[stage]]))),
+        ...(waiverMessage ? { "Message Id": waiverMessage } : {}),
       } : {}),
       ...claimAttemptFields(projectDir, unit),
     }, projectDir);
@@ -1635,9 +1719,13 @@ export function askConstructionCheckpoint(
     // The person may have answered while the Unit's review ran: their words
     // typed in this chat after it was asked for and before any other question
     // was asked (gateWordsSinceUnitReview), read before this question's own
-    // row, are its reply, kept as a reply typed after it is.
+    // row, are its reply, kept as a reply typed after it is, for the conductor
+    // to read.
     const earlier = gateWordsSinceUnitReview(projectDir, session, unit, current.result.stages);
     withdrawProtectedQuestions(projectDir, session);
+    const asked = askedQuestionFields(projectDir, {
+      type: "unit-checkpoint", shows: questionShows([current.result.fingerprint]), chat: session,
+    });
     appendAuditEntryUnlocked("DECISION_RECORDED", {
       Checkpoint: "Construction Unit Approval", Unit: unit, Kind: kind,
       Stage: current.result.stages.at(-1)!, Fingerprint: current.result.fingerprint,
@@ -1645,6 +1733,7 @@ export function askConstructionCheckpoint(
       // What the person is shown, so a change before their answer is said
       // once instead of asking again (relaxed and off).
       "Asked Evidence": current.approvedEvidence, "Run floors": JSON.stringify(current.result.run_floors),
+      ...asked,
     }, projectDir);
     const question = mintProtectedQuestion(projectDir, {
       kind: "checkpoint-approval", session, target: approvalTarget(current), choices: APPROVAL_GATE_CHOICES,
@@ -1654,23 +1743,41 @@ export function askConstructionCheckpoint(
       .map((slug) => join(current.root, "construction", unit, slug, "traceability.json")));
     const offer = current.result.stages.map((slug) => findStageBySlug(slug))
       .map((stage) => stage ? reviewCheckOffer(projectDir, stage, unit) : null).find((found) => found !== null) ?? null;
+    const changedFiles = current.result.stages.includes("code-generation")
+      ? unheardBroughtFilesLine(projectDir, readStateFile(projectDir), session, true)
+      : null;
+    // With their reply already in, the question is not shown: the line about
+    // their files rides the next step the agent speaks from instead.
+    const carried = changedFiles !== null && earlier !== null &&
+      addPendingPersonLines(projectDir, session, [changedFiles.line]);
+    if (changedFiles !== null && (earlier === null || carried)) markPersonLinesHeard(projectDir, session, [changedFiles.key]);
     const result = {
       ...current.result,
+      question_id: asked[QUESTION_ID_FIELD],
       ...(leftOut === null ? {} : { left_out: leftOut }),
+      ...(changedFiles === null || carried ? {} : { changed_files: changedFiles.line }),
       ...(offer === null ? {} : { check_offer: offer.offer }),
     };
     if (earlier === null) return result;
-    const words = earlier.join("\n").slice(-PROTECTED_RESPONSE_WORDS_MAX_CHARS);
-    const pick = protectedQuestionPick(question, earlier.at(-1));
+    const words = earlier.map((reply) => reply.words).join("\n").slice(-PROTECTED_RESPONSE_WORDS_MAX_CHARS);
     markProtectedQuestionReplied(projectDir, question);
     writeProtectedResponse(projectDir, {
       version: 1, session, challengeId: question.challengeId,
-      ...(pick === null ? {} : { choice: pick }),
       responseSha256: createHash("sha256").update(words, "utf-8").digest("hex"),
       words,
+      at: isoTimestamp(),
+      replies: earlier.slice(-PROTECTED_RESPONSE_REPLIES_MAX),
     });
     return { ...result, earlier_reply: words };
   });
+}
+
+// A Unit checkpoint's reply the agent names: after the Unit's review was
+// requested in the checkpoint's stages, else after their start.
+function namedReply(
+  projectDir: string, stages: readonly string[], unit: string, message: string | undefined,
+): { message: string; floor: string | null } | undefined {
+  return message === undefined ? undefined : { message, floor: protectedReplyFloor(projectDir, stages, [unit]) };
 }
 
 export function approveConstructionCheckpoint(
@@ -1680,6 +1787,8 @@ export function approveConstructionCheckpoint(
   reply?: string,
   session = "",
   findingDispositions?: ApprovalFindingDispositions,
+  // The message the agent read the approval from, when it names one.
+  message?: string,
 ): ConstructionCheckpoint {
   // The conductor read the person's reply and reports their approval. The
   // receipt records it beside the person's own words, kept by the human-turn
@@ -1694,16 +1803,21 @@ export function approveConstructionCheckpoint(
     // The person's "approve it as it is", which the verification took, is the
     // approval; nothing more is asked of them.
     const inWords = current.result.review_not_finished?.approved_in_words === true;
-    let words: string | undefined;
+    let theirs: Record<string, string> = {};
     if (humanRequired && inWords) {
       // Already approved from their words: an approve run again records nothing more.
       if (current.result.approved) return current.result;
-      words = latestPersonTurn(projectDir)?.words ?? undefined;
+      // Their words are the message the verification took their approval from.
+      const named = current.waiverMessage === null ? null : readMessage(projectDir, current.waiverMessage);
+      theirs = {
+        ...(named?.words ? { "Person Reply": personsWordsText(named.words) } : {}),
+        ...(current.waiverMessage ? { "Message Id": current.waiverMessage } : {}),
+      };
     } else if (humanRequired) {
       requireProtectedResponse(projectDir, session, {
         kind: "checkpoint-approval", targetDigest: protectedTargetDigest(approvalTarget(current)), choice: "Approve",
-      });
-      words = readProtectedResponse(projectDir, session)?.words;
+      }, namedReply(projectDir, current.result.stages, unit, message));
+      theirs = protectedResponseFields(readProtectedResponse(projectDir, session));
     } else if (current.result.approved) {
       return current.result;
     }
@@ -1730,7 +1844,7 @@ export function approveConstructionCheckpoint(
       "Approved Evidence": rechecked.approvedEvidence,
       ...(humanRequired ? { Session: session } : {}),
       ...(humanRequired ? { "User Input": "Approve" } : { Autonomous: "true" }),
-      ...(words ? { "Person Reply": words } : {}),
+      ...theirs,
       ...(notFinished ? { Review: "not finished" } : {}),
       ...findingDispositions?.(
         gate["Gate Stages"].split(", ").filter(Boolean), [unit], humanRequired ? "person" : "nobody",
@@ -1773,6 +1887,8 @@ export function rejectConstructionCheckpoint(
   _reply: string,
   givenReason: string,
   session = "",
+  message?: string,
+  rejectedFindings?: RejectedFindingDispositions,
 ): ConstructionCheckpoint {
   // The conductor read the person's reply as a change request. What they said
   // to change is the reason: the conductor's --reason when given, otherwise the
@@ -1784,23 +1900,24 @@ export function rejectConstructionCheckpoint(
     }
     requireProtectedResponse(projectDir, session, {
       kind: "checkpoint-approval", targetDigest: protectedTargetDigest(approvalTarget(current)), choice: "Request Changes",
-    });
-    const words = readProtectedResponse(projectDir, session)?.words;
-    const reason = givenReason.trim() || changeRequestWords(words);
+    }, namedReply(projectDir, current.result.stages, unit, message));
+    const response = readProtectedResponse(projectDir, session);
+    const reason = givenReason.trim() || changeRequestWords(response?.words);
     const userInput = "Request Changes";
-    if (isNonAnswer(reason) || reason.length > 8192 || hasUnsafeSingleLineCharacter(reason) ||
-      selfAttributedDecisionMarker(reason, "rejection")) {
+    if (isNonAnswer(reason) || reason.length > 8192 || hasUnsafeSingleLineCharacter(reason)) {
       throw new Error("Request Changes needs what the person asked to change, on one line, in --reason.");
     }
     const rechecked = snapshot(projectDir, unit, kind);
     if (current.root !== rechecked.root || current.result.fingerprint !== rechecked.result.fingerprint) {
       throw new Error("Construction checkpoint evidence changed before rejection.");
     }
+    const gate = gateFields(projectDir, rechecked.result, rechecked.state);
     appendAuditEntryUnlocked("GATE_REJECTED", {
-      ...gateFields(projectDir, rechecked.result, rechecked.state),
+      ...gate,
       Session: session,
       "User Input": userInput, Feedback: reason, Reason: reason,
-      ...(words ? { "Person Reply": words } : {}),
+      ...protectedResponseFields(response),
+      ...rejectedFindings?.(gate["Gate Stages"].split(", ").filter(Boolean), [unit]),
     }, projectDir);
     consumeProtectedQuestion(projectDir, session);
     return resolveConstructionCheckpoint(projectDir, unit, kind);

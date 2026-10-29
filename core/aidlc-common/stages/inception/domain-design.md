@@ -191,11 +191,14 @@ Use stage-protocol.md completion template with completion emoji: :building_const
 - Structured approval question with options:
   - Approve (continue to next stage)
   - Request Changes (provide revision feedback)
-  - Add Units Generation (if it was skipped in execution plan)
+  - Approve, and add Units Generation next (if it was skipped in execution plan)
 
-If "Add Units Generation" is selected, run
-`{{INVOKE}} engine recompose --add units-generation`
-before re-entering the approval flow.
+If they pick "Approve, and add Units Generation next", run
+`{{INVOKE}} engine orchestrate next --add units-generation` and follow its
+step, which names the report that records their approval; Units Generation
+runs next. If they only ask to add Units Generation, run the same
+`next --add units-generation`, say in one line that it is on the plan, and ask
+once whether they approve the design as it is or want anything changed.
 
 ## Sensors
 
@@ -212,6 +215,6 @@ fallback functional requirement, is declared and covered.
 
 When `directive.protocol_modules` lists `learnings`, follow
 `stage-protocol-learnings.md`: keep the diary at `directive.memory_path` while
-working and run the ritual before the approval gate, applying its bootstrap,
-`single: true`, per-unit, and gate-revision exemptions. When the module is absent,
-skip both the diary and the ritual.
+working, and take the learnings step before the approval gate; that module says
+when it asks the person anything. When the module is absent, skip both the diary
+and the step.

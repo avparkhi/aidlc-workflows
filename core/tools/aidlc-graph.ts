@@ -100,6 +100,7 @@ import {
   resolveProjectDir,
   resolveProjectFlag,
   resolveWorkflowSelection,
+  REVIEW_CLASSES,
   type ReviewClass,
   scalarField,
   type ScopeDefinition,
@@ -255,6 +256,12 @@ export interface GraphStage extends StageEntry {
   summary_confirmation?: "required" | "if-present";
 }
 
+/** A stage a custom plan skips and the stages it keeps that use what it makes. */
+export interface SkippedInput {
+  stage: string;
+  used_by: string[];
+}
+
 export interface ScopeValidation {
   valid: boolean;
   errors: string[];
@@ -262,7 +269,9 @@ export interface ScopeValidation {
   // The deterministic ceremony count of the validated grid (stage/gate/per-unit
   // counts). The composer copies this into its proposal verbatim so the gate the
   // human sees leads with numbers the validator computed, not an LLM recount.
-  summary?: ScopeCostSummary;
+  // A passing --custom run adds skipped_inputs when the plan's own skips leave a
+  // kept stage without what it uses: the offer says it once, in one line.
+  summary?: ScopeCostSummary & { skipped_inputs?: SkippedInput[] };
   // Graph/plugin-authored stock scopes ranked by grid distance from the
   // validated proposal; composer-authored entries are excluded. A front/report
   // matched-vs-custom verdict routes on nearest_stock[0].diff (match when <= 2
@@ -423,7 +432,7 @@ function memoryDisplayPath(rel: string): string {
  *  `<projectDir>/aidlc/spaces/<space>/memory`. FOLLOWS the active-space cursor —
  *  `space` defaults to `activeSpace(projectDir)` (which itself falls back to
  *  `default` when no cursor is set), mirroring the `space?`/`?? activeSpace`
- *  shape of codekbDir()/knowledgeDir()/intentsDir() in aidlc-lib.ts. So the
+ *  shape of codekbDir()/knowledgeDir() in aidlc-lib.ts and intentsDir() in aidlc-locks.ts. So the
  *  learnings/practices writers that resolve through here land under the active
  *  space, while a cursorless resolve still yields `default`. The path layout
  *  stays byte-aligned with the packager's emit and the native includes via
@@ -1291,7 +1300,7 @@ export function loadSensors(): Map<string, SensorFile> {
     if (typeof manifest.id === "string" && out.has(manifest.id)) {
       const previous = mustGet(out, manifest.id, "sensor-manifest dup");
       throw new Error(
-        `${filePath}: duplicate sensor id "${manifest.id}" — also declared ` +
+        `${filePath}: duplicate sensor id "${manifest.id}" - also declared ` +
           `in ${previous.path}. Rename one of them.`,
       );
     }
@@ -1429,6 +1438,13 @@ export function consumedArtifactProducerCollisions(): {
  *  threads --deliverables for them), so one evaluation per folder is the
  *  stage's verdict. The dispatcher and the gate both read this set. */
 export const STAGE_WIDE_SENSOR_IDS: ReadonlySet<string> = new Set(["upstream-coverage", "claim-sources"]);
+
+/** The sensors whose script evaluates a set of output paths handed on stdin
+ *  (`--paths-stdin json`), each path as it would evaluate it alone. At a codekb
+ *  stage, whose outputs span one folder per repository, the gate fires each of
+ *  these once for the stage over every repository's files instead of once per
+ *  file or folder; every other stage keeps its fires. */
+export const PATH_SET_SENSOR_IDS: ReadonlySet<string> = new Set(["required-sections", "upstream-coverage"]);
 
 export function templateEligibleArtifacts(produces: string[]): string[] {
   return (produces ?? []).filter(
@@ -1747,49 +1763,24 @@ export function validateGrid(
     );
   }
 
-  const onPath = new Set(
-    Object.entries(grid)
-      .filter(([slug, action]) => action === "EXECUTE" && knownSlugs.has(slug))
-      .map(([slug]) => slug)
-  );
-  const subgraph = graph
-    .filter((s) => onPath.has(s.slug))
-    .sort((a, b) => numericStageOrder(a.number, b.number));
-
-  for (const stage of subgraph) {
-    for (const consume of stage.consumes ?? []) {
-      // required: false -> silent
-      if (!consume.required) continue;
-      // projectType filter for conditional consumes
-      if (
-        consume.conditional_on &&
-        opts?.projectType &&
-        consume.conditional_on !== opts.projectType
-      ) {
-        continue;
-      }
-      const producers = producersOf(consume.artifact);
-      if (producers.length === 0) {
-        errors.push(
-          `Stage "${stage.slug}" requires artifact "${consume.artifact}" ` +
-            `but no stage in the graph produces it.`
-        );
-        continue;
-      }
-      const onPathProducers = producers.filter((p) => onPath.has(p.slug));
-      if (onPathProducers.length === 0) {
-        const message =
-          `Stage "${stage.slug}" requires artifact "${consume.artifact}" ` +
-          `whose producer(s) [${producers.map((p) => p.slug).join(", ")}] ` +
-          `are not on the "${label}" path.`;
-        if (opts?.strict) {
-          errors.push(
-            `${message} Strict (recompose) mode rejects a starved required input.`
-          );
-        } else {
-          advisories.push(`${message} Ensure existing artifact is current.`);
-        }
-      }
+  for (const { stage, artifact, producers } of unmadeInputs(grid, opts?.projectType)) {
+    if (producers.length === 0) {
+      errors.push(
+        `Stage "${stage.slug}" requires artifact "${artifact}" ` +
+          `but no stage in the graph produces it.`
+      );
+      continue;
+    }
+    const message =
+      `Stage "${stage.slug}" requires artifact "${artifact}" ` +
+      `whose producer(s) [${producers.map((p) => p.slug).join(", ")}] ` +
+      `are not on the "${label}" path.`;
+    if (opts?.strict) {
+      errors.push(
+        `${message} Strict (recompose) mode rejects a starved required input.`
+      );
+    } else {
+      advisories.push(`${message} Ensure existing artifact is current.`);
     }
   }
 
@@ -1812,6 +1803,60 @@ export function validateGrid(
     grid as Record<string, "EXECUTE" | "SKIP">,
   );
   return { valid: errors.length === 0, errors, advisories, summary, nearest_stock };
+}
+
+/** Each required input `grid` leaves unmade: a stage it runs whose required
+ *  artifact no stage it runs produces (`producers` empty when no stage in the
+ *  graph does). In stage order, then consume order. The one walk behind
+ *  validateGrid's errors and advisories and the plan offer's skippedInputs.
+ *  required: false is silent; projectType filters conditional_on consumes. */
+function unmadeInputs(
+  grid: Record<string, string>,
+  projectType?: "brownfield" | "greenfield",
+): Array<{ stage: GraphStage; artifact: string; producers: GraphStage[] }> {
+  const graph = loadGraph();
+  const onPath = new Set(graph.filter((s) => grid[s.slug] === "EXECUTE").map((s) => s.slug));
+  const subgraph = graph
+    .filter((s) => onPath.has(s.slug))
+    .sort((a, b) => numericStageOrder(a.number, b.number));
+  const unmade: Array<{ stage: GraphStage; artifact: string; producers: GraphStage[] }> = [];
+  for (const stage of subgraph) {
+    for (const consume of stage.consumes ?? []) {
+      if (!consume.required) continue;
+      if (consume.conditional_on && projectType && consume.conditional_on !== projectType) continue;
+      const producers = producersOf(consume.artifact);
+      if (producers.some((p) => onPath.has(p.slug))) continue;
+      unmade.push({ stage, artifact: consume.artifact, producers });
+    }
+  }
+  return unmade;
+}
+
+/** The stages a custom plan skips that a stage it keeps uses, where the plan's
+ *  own changes cause it. A stock scope leaves some inputs unmade by design
+ *  (t66 pins those edges), so a skipped producer is named only when one of the
+ *  plan's unmade inputs it would make is not one `base`, the stock scope the
+ *  plan runs on, leaves unmade too (the plan skipped it, or added a stage that
+ *  needs it); it is then named with every kept stage that uses what it makes,
+ *  so the offer's one line is whole. Display names, in stage order. */
+function skippedInputs(
+  plan: Record<string, string>,
+  base: Record<string, string>,
+  projectType?: "brownfield" | "greenfield",
+): SkippedInput[] {
+  const key = (gap: { stage: GraphStage; artifact: string }): string => `${gap.stage.slug} ${gap.artifact}`;
+  const onBase = new Set(unmadeInputs(base, projectType).map(key));
+  const gaps = unmadeInputs(plan, projectType).filter((gap) => gap.producers.length > 0);
+  const named = new Set(gaps.filter((gap) => !onBase.has(key(gap))).flatMap((gap) => gap.producers.map((p) => p.slug)));
+  return loadGraph()
+    .filter((s) => named.has(s.slug))
+    .sort((a, b) => numericStageOrder(a.number, b.number))
+    .map((producer) => ({
+      stage: producer.name,
+      used_by: [...new Set(
+        gaps.filter((gap) => gap.producers.some((p) => p.slug === producer.slug)).map((gap) => gap.stage.name),
+      )],
+    }));
 }
 
 /** Check a composer proposal's `scopeSettings` member. All four keys are
@@ -2642,7 +2687,7 @@ export function compileStageGraph(): {
       const previousFile = slugToFile.get(slug);
       if (previousFile) {
         throw new Error(
-          `Duplicate stage slug "${slug}" in ${filePath} — already declared ` +
+          `Duplicate stage slug "${slug}" in ${filePath} - already declared ` +
             `in ${previousFile}. Rename one of them.`
         );
       }
@@ -2710,7 +2755,7 @@ export function compileStageGraph(): {
       .map(({ file, slug }) => `${file} (stage "${slug}")`)
       .join(", ");
     throw new Error(
-      `Duplicate producers for consumed artifact "${artifact}" in ${producerList} — ` +
+      `Duplicate producers for consumed artifact "${artifact}" in ${producerList} - ` +
         `consumed by stage "${consumer.slug}" in ${consumer.file}. ` +
         `Rename one produced artifact or update the consumer.`
     );
@@ -2844,7 +2889,7 @@ export function compileStageGraph(): {
       if (numericStageOrder(depNum, stage.number) >= 0) {
         throw new Error(
           `Compile invariant violated: stage "${stage.slug}" (${stage.number}) ` +
-            `requires "${dep}" (${depNum}) — dependency must be lower-numbered. ` +
+            `requires "${dep}" (${depNum}) - dependency must be lower-numbered. ` +
             `Fix: either renumber in stage-graph.json to match the dependency ` +
             `direction, or remove the offending requires_stage edge.`
         );
@@ -2870,7 +2915,7 @@ export function compileStageGraph(): {
       console.error(
         `[advisory] stage "${stage.slug}" is the per-unit build stage ` +
           `(for_each: unit-of-work + workspace_requires) but mode is ` +
-          `"${stage.mode}", not "subagent" — the autonomous Construction ` +
+          `"${stage.mode}", not "subagent" - the autonomous Construction ` +
           `swarm will NOT fire for it; units build serially.`
       );
     }
@@ -3608,17 +3653,65 @@ export function computeArs(
 }
 
 // The composer's scores for the plan a front compose dispatch is working out
-// (#2575). The dispatch opens the record with its request id; `ars`
-// fills it with the scores it screened; creation of the plan the composer
-// validated writes them on WORKFLOW_STARTED and removes the record. It sits
+// (#2575). The dispatch opens the record with its request id and the project
+// type the scan found then; `ars` fills it with the scores it screened, and
+// `validate-grid` keeps the plan its last routed run passed, the one the gate
+// shows, with the project type that run was given. Creation of that plan takes
+// its stage changes, and its type when the composer planned for another type
+// than that scan's (the person's word, never a scan the folder has outgrown),
+// writes the scores on WORKFLOW_STARTED, then removes the record. The plan
+// also keeps the depth, settings and Guard Policy the gate showed beside its
+// stages, so the creation that approves it runs at them. The plan the gate
+// showed is the one kept before the person's reply to it: each plan keeps the
+// time it was kept, and a different plan validated later moves it to `earlier`,
+// so a composer run again after the reply (one gone by the Approve turn, a new
+// chat) never stands in for the plan they saw (keptComposerPlans). It sits
 // beside the proposal, in the space's gitignored engine dir. Every step is
 // best-effort: a record that cannot be read or written records nothing.
 export type ArsMethod = "codekb" | "fallback";
+type ProjectTypeWord = "brownfield" | "greenfield";
 interface ComposerScores {
   request: string;
+  scanned?: ProjectTypeWord;
   scores?: Record<ArsComponent, number>;
   method?: ArsMethod;
+  plan?: KeptComposerPlan;
+  // The plans kept before `plan`, oldest first.
+  earlier?: KeptComposerPlan[];
+  // Creation named the approval of the plan the person saw (markComposerPlanNamed).
+  named?: true;
 }
+const isProjectTypeWord = (value: unknown): value is ProjectTypeWord => value === "brownfield" || value === "greenfield";
+export interface KeptComposerPlan {
+  scope: string;
+  changes: PlanChanges;
+  projectType?: ProjectTypeWord;
+  // Each only where it differs from the scope the plan runs on: creation_depth,
+  // creation_settings, and a Guard Policy above that scope's default.
+  depth?: CreationDepth;
+  settings?: SettingsChanges;
+  guardPolicy?: GuardPolicy;
+  // When a routed run kept it. A plan an older version kept has none.
+  at?: string;
+}
+const KEPT_EARLIER_MAX = 8;
+type CreationDepth = NonNullable<ScopeValidation["creation_depth"]>;
+const CREATION_DEPTHS: readonly CreationDepth[] = ["minimal", "standard", "comprehensive"];
+
+/** A kept settings record whose every key is a setting and every value one of
+ *  its words, or null: a record edited by hand never reaches a command. */
+function keptSettings(value: unknown): SettingsChanges | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const settings: SettingsChanges = {};
+  for (const [key, word] of Object.entries(value)) {
+    if (key === "review" && (REVIEW_CLASSES as readonly unknown[]).includes(word)) settings.review = word as ReviewClass;
+    else if ((CEREMONY_KEYS as readonly string[]).includes(key) && (word === "on" || word === "off")) settings[key as CeremonyKey] = word;
+    else return null;
+  }
+  return settings;
+}
+
+const KEPT_SLUG = /^[a-z0-9][a-z0-9-]*$/;
 
 export function composerScoresPath(projectDir: string): string {
   return join(dirname(composerProposalPath(projectDir)), "composer-scores.json");
@@ -3635,23 +3728,56 @@ function readComposerScores(projectDir: string): ComposerScores | null {
     ) as Partial<ComposerScores> | null;
     if (typeof parsed?.request !== "string" || parsed.request === "") return null;
     const record: ComposerScores = { request: parsed.request };
+    if (isProjectTypeWord(parsed.scanned)) record.scanned = parsed.scanned;
     const scores = parsed.scores;
     if (scores !== undefined) {
       if (!ARS_COMPONENTS.every((c) => typeof scores?.[c] === "number" && scores[c] >= 0 && scores[c] <= 1)) return null;
       record.scores = Object.fromEntries(ARS_COMPONENTS.map((c) => [c, scores[c]])) as Record<ArsComponent, number>;
     }
     if (parsed.method === "codekb" || parsed.method === "fallback") record.method = parsed.method;
+    const plan = keptPlanOf(parsed.plan);
+    if (plan !== null) record.plan = plan;
+    const earlier = Array.isArray(parsed.earlier) ? parsed.earlier.flatMap((entry) => keptPlanOf(entry) ?? []) : [];
+    if (plan !== null && earlier.length > 0) record.earlier = earlier.slice(-KEPT_EARLIER_MAX);
+    if (plan !== null && parsed.named === true) record.named = true;
     return record;
   } catch {
     return null;
   }
 }
 
+function keptPlanOf(plan: KeptComposerPlan | undefined): KeptComposerPlan | null {
+  const slugs = (list: unknown): list is string[] =>
+    Array.isArray(list) && list.every((slug) => typeof slug === "string" && KEPT_SLUG.test(slug));
+  if (typeof plan?.scope !== "string" || !KEPT_SLUG.test(plan.scope) || !slugs(plan.changes?.skip) || !slugs(plan.changes?.add)) {
+    return null;
+  }
+  const kept: KeptComposerPlan = { scope: plan.scope, changes: { skip: plan.changes.skip, add: plan.changes.add } };
+  if (isProjectTypeWord(plan.projectType)) kept.projectType = plan.projectType;
+  if ((CREATION_DEPTHS as readonly unknown[]).includes(plan.depth)) kept.depth = plan.depth;
+  const settings = keptSettings(plan.settings);
+  if (settings !== null) kept.settings = settings;
+  if (plan.guardPolicy === "strict" || plan.guardPolicy === "relaxed") kept.guardPolicy = plan.guardPolicy;
+  if (typeof plan.at === "string" && !Number.isNaN(Date.parse(plan.at))) kept.at = plan.at;
+  return kept;
+}
+
+/** The same plan, whenever it was kept. */
+function sameKeptPlan(a: KeptComposerPlan, b: KeptComposerPlan): boolean {
+  const key = (plan: KeptComposerPlan): string => JSON.stringify([
+    plan.scope, [...plan.changes.skip].sort(), [...plan.changes.add].sort(), plan.projectType ?? null, plan.depth ?? null,
+    Object.entries(plan.settings ?? {}).sort(([x], [y]) => x.localeCompare(y)), plan.guardPolicy ?? null,
+  ]);
+  return key(a) === key(b);
+}
+
 /** A front compose dispatch for `request` opens a fresh record, replacing any
- *  an earlier composition left. */
-export function openComposerScores(projectDir: string, request: string): void {
+ *  an earlier composition left, with the project type the scan found as it
+ *  dispatched (none when the scan could not say). */
+export function openComposerScores(projectDir: string, request: string, scanned?: string | null): void {
+  const record: ComposerScores = { request, ...(isProjectTypeWord(scanned) ? { scanned } : {}) };
   try {
-    writeRecordFileNoFollow(projectDir, composerScoresRel(projectDir), `${JSON.stringify({ request })}\n`);
+    writeRecordFileNoFollow(projectDir, composerScoresRel(projectDir), `${JSON.stringify(record)}\n`);
   } catch {
     // No record: the plan's creation records no scores.
   }
@@ -3664,8 +3790,12 @@ function fillComposerScores(projectDir: string, scores: Record<ArsComponent, num
   if (open === null) return;
   const record: ComposerScores = {
     request: open.request,
+    ...(open.scanned ? { scanned: open.scanned } : {}),
     scores: Object.fromEntries(ARS_COMPONENTS.map((c) => [c, scores[c]])) as Record<ArsComponent, number>,
     ...(method ? { method } : {}),
+    ...(open.plan ? { plan: open.plan } : {}),
+    ...(open.earlier ? { earlier: open.earlier } : {}),
+    ...(open.named ? { named: open.named } : {}),
   };
   try {
     writeRecordFileNoFollow(projectDir, composerScoresRel(projectDir), `${JSON.stringify(record)}\n`);
@@ -3673,6 +3803,97 @@ function fillComposerScores(projectDir: string, scores: Record<ArsComponent, num
     // Unwritten: creation records no scores.
   }
 }
+
+/** A routed `validate-grid` run that passes keeps its plan in a record a
+ *  dispatch opened, with the time it kept it; a different plan moves the one
+ *  kept before it to `earlier` and clears the named mark, and the same plan
+ *  again keeps its first time. With no record open it writes nothing. */
+function keepComposerPlan(projectDir: string, plan: KeptComposerPlan): void {
+  const open = readComposerScores(projectDir);
+  if (open === null || (open.plan !== undefined && sameKeptPlan(open.plan, plan))) return;
+  const { named: _named, ...kept } = open;
+  const record: ComposerScores = {
+    ...kept,
+    plan: { ...plan, at: new Date().toISOString() },
+    ...(open.plan ? { earlier: [...(open.earlier ?? []), open.plan].slice(-KEPT_EARLIER_MAX) } : {}),
+  };
+  try {
+    writeRecordFileNoFollow(projectDir, composerScoresRel(projectDir), `${JSON.stringify(record)}\n`);
+  } catch {
+    // Unwritten: creation takes the stage changes and type the command carries.
+  }
+}
+
+/** The plans kept for one of `requests` (a creation's request and the one it
+ *  was composed from): `shown`, the newest the person replied after (`seen`
+ *  says whether they replied since a time; a plan an older version kept counts
+ *  as seen), the one their gate showed; `unseen`, the newest plan when it was
+ *  kept after that reply; and `named`, whether creation named the shown plan's
+ *  approval since. Null when the record belongs to other work or keeps no plan. */
+export function keptComposerPlans(
+  projectDir: string,
+  requests: readonly string[],
+  seen: (at: string) => boolean,
+): { shown: KeptComposerPlan | null; unseen: KeptComposerPlan | null; named: boolean } | null {
+  const record = readComposerScores(projectDir);
+  if (record?.plan === undefined || !requests.includes(record.request)) return null;
+  return { ...shownAndUnseen(record.plan, record.earlier ?? [], seen), named: record.named === true };
+}
+
+/** Creation named the approval of the plan the person saw for one of
+ *  `requests`: once said, a creation typed with that plan's stages is created
+ *  as typed, with any setting the person asked for in their own words. */
+export function markComposerPlanNamed(projectDir: string, requests: readonly string[]): void {
+  const record = readComposerScores(projectDir);
+  if (record?.plan === undefined || !requests.includes(record.request) || record.named) return;
+  try {
+    writeRecordFileNoFollow(projectDir, composerScoresRel(projectDir), `${JSON.stringify({ ...record, named: true })}\n`);
+  } catch {
+    // Unwritten: the step is said again at the next creation.
+  }
+}
+
+function shownAndUnseen(
+  plan: KeptComposerPlan,
+  earlier: readonly KeptComposerPlan[],
+  seen: (at: string) => boolean,
+): { shown: KeptComposerPlan | null; unseen: KeptComposerPlan | null } {
+  const plans = [...earlier, plan];
+  let shown = plans.length - 1;
+  while (shown >= 0 && plans[shown].at !== undefined && !seen(plans[shown].at as string)) shown--;
+  return { shown: plans[shown] ?? null, unseen: shown < plans.length - 1 ? plan : null };
+}
+
+/** The plan the composer validated for one of `requests` on `scope` that the
+ *  person saw (keptComposerPlans; without `seen`, the plan kept last): the
+ *  stage changes creation of the approved plan carries, whatever list was
+ *  typed for it, and the project type it was validated for when that is not
+ *  the type the scan found as the dispatch opened the record: the composer
+ *  plans on the scan's type unless the person said otherwise, so only their
+ *  word is carried. The depth, settings and Guard Policy the gate showed ride
+ *  with it. Null when the record belongs to other work, keeps no plan (one an
+ *  older version wrote), or the plan they saw runs on another scope. */
+export function approvedComposerPlan(
+  projectDir: string,
+  requests: readonly string[],
+  scope: string,
+  seen: (at: string) => boolean = () => true,
+): ApprovedComposerPlan | null {
+  const record = readComposerScores(projectDir);
+  if (record?.plan === undefined || !requests.includes(record.request)) return null;
+  const plan = shownAndUnseen(record.plan, record.earlier ?? [], seen).shown;
+  if (plan === null || plan.scope !== scope) return null;
+  const { changes, depth, settings, guardPolicy } = plan;
+  const theirs = plan.projectType !== undefined && record.scanned !== undefined && plan.projectType !== record.scanned;
+  return {
+    changes,
+    ...(theirs ? { projectType: plan.projectType } : {}),
+    ...(depth ? { depth } : {}),
+    ...(settings ? { settings } : {}),
+    ...(guardPolicy ? { guardPolicy } : {}),
+  };
+}
+export type ApprovedComposerPlan = Omit<KeptComposerPlan, "scope" | "at">;
 
 /** The WORKFLOW_STARTED fields for a plan being created for `requests` (its
  *  request id and the one it was composed from): the composer's scores when
@@ -4013,6 +4234,8 @@ const COMMANDS: Record<string, Handler> = {
         } else if (base !== null && !("error" in base)) {
           r.base_scope = base.scope;
           r.plan_changes = base.changes;
+          const skipped = skippedInputs(grid, loadScopeGrid()[base.scope]?.stages ?? {}, projectType);
+          if (skipped.length > 0 && r.summary) r.summary.skipped_inputs = skipped;
           r.creation_settings = creationSettingsFor(base.scope, r.scope_settings);
           const baseDepth = (loadScopeMapping()[base.scope]?.depth ?? "").toLowerCase();
           if (planDepth !== undefined && planDepth !== baseDepth) r.creation_depth = planDepth;
@@ -4020,6 +4243,21 @@ const COMMANDS: Record<string, Handler> = {
       }
     }
     r.valid = r.errors.length === 0;
+    if (r.valid && r.routing !== undefined) {
+      const kept = r.routing === "matched" ? r.matched_scope : r.base_scope;
+      if (kept !== undefined) {
+        const raised = r.guard_policy !== undefined && r.guard_policy !== scopeGuardPolicyDefault(kept) &&
+          guardPolicyAtLeast(r.guard_policy, scopeGuardPolicyDefault(kept));
+        keepComposerPlan(resolveProjectDir(), {
+          scope: kept,
+          changes: r.plan_changes ?? { skip: [], add: [] },
+          ...(projectType ? { projectType } : {}),
+          ...(r.creation_depth ? { depth: r.creation_depth } : {}),
+          ...(r.creation_settings && Object.keys(r.creation_settings).length > 0 ? { settings: r.creation_settings } : {}),
+          ...(raised ? { guardPolicy: r.guard_policy } : {}),
+        });
+      }
+    }
     process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
     if (!r.valid) process.exit(1);
   },

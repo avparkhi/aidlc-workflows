@@ -52,7 +52,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { appendAuditEntry } from "../../dist/claude/.claude/tools/aidlc-audit.ts";
-import { readAllAuditShards } from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+import { auditBlockField, readAllAuditShards, readAuditShardEvents } from "../../dist/claude/.claude/tools/aidlc-lib.ts";
 import {
   cleanupTestProject,
   createTestProject,
@@ -136,7 +136,7 @@ function scopeChange(args: string[], p: string, env: Record<string, string> = {}
 
 /**
  * Value of `- **<key>**: <value>` from the aidlc-state.md body. Mirrors the
- * getField the tool uses (aidlc-lib.ts). Returns "" when absent.
+ * getField the tool uses (aidlc-record-core.ts). Returns "" when absent.
  */
 function stateField(file: string, key: string): string {
   if (!existsSync(file)) return "";
@@ -265,6 +265,9 @@ describe("t36 aidlc-utility scope-change — CLI contract (migrated from t36-uti
     const r = scopeChange(["--scope", "mvp"], p);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("Construction Autonomy Mode is autonomous");
+    // What it found is no request on record, which can be a person who is there.
+    expect(r.out).toContain("without a request from the person for this change on record");
+    expect(r.out).not.toContain("nobody here");
     // The step it names is one that runs: the setter's real command, and no
     // wait that never ends (the mode stays autonomous to the end of the run).
     expect(r.out).toMatch(/`[^`]*aidlc[^`]*bolt[^`]* set-autonomy --mode gated`/);
@@ -331,7 +334,8 @@ describe("t36 aidlc-utility scope-change — CLI contract (migrated from t36-uti
 
   // One reply that approves and asks for a lower-policy scope: the approval
   // recorded from it does not use up the request, so the scope's own lower
-  // Guard Policy follows, as when the person asked for the change alone.
+  // Guard Policy follows on the message the agent names, as when the person
+  // asked for the change alone.
   test("8d: \"approve it, and switch to mvp\" on enterprise lowers Guard Policy with the scope", () => {
     const p = proj();
     const sp = statePath(p);
@@ -346,8 +350,11 @@ describe("t36 aidlc-utility scope-change — CLI contract (migrated from t36-uti
       encoding: "utf-8",
     });
     expect(hook.status, `${hook.stdout}${hook.stderr}`).toBe(0);
-    appendAuditEntry("GATE_APPROVED", { Stage: "feasibility", "User Input": "Approve" }, p);
-    const r = scopeChange(["--scope", "mvp"], p);
+    const turn = readAuditShardEvents(p).filter((row) => row.event === "HUMAN_TURN").at(-1);
+    const id = turn === undefined ? null : auditBlockField(turn.block, "Message Id");
+    expect(id).not.toBeNull();
+    appendAuditEntry("GATE_APPROVED", { Stage: "feasibility", "User Input": "Approve", "Message Id": id as string }, p);
+    const r = scopeChange(["--scope", "mvp", "--message", id as string], p);
     expect(r.status, r.out).toBe(0);
     expect(r.out).toContain("Switched to mvp");
     expect(r.out).not.toContain("Guard Policy stays");

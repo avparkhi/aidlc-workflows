@@ -129,7 +129,7 @@ const AUDIT_TOOL_STUB = `export function appendAuditEntry(_k: string, _d: unknow
 const LIB_TOOL_STUB = `import { join } from "node:path";
 // The engine's own reading of a line is pure, so the rig uses the real one, and
 // the real in-process hook runner, which runs the stub guards beside it.
-export { beforeDelimiter, boundDirectiveMessage, ENGINE_OWNED_STATE_TRANSITIONS, nextLineFlags, readOrchestratorLauncherOptions, runHookHere } from ${JSON.stringify(join(REPO_ROOT, "core", "tools", "aidlc-lib.ts"))};
+export { beforeDelimiter, boundDirectiveMessage, ENGINE_OWNED_STATE_TRANSITIONS, nextLineFlags, readOrchestratorLauncherOptions, runHookHere, sessionsDir, validSessionId } from ${JSON.stringify(join(REPO_ROOT, "core", "tools", "aidlc-lib.ts"))};
 export function decideFence(): { decision: "hold" | "stand-aside" } {
   return { decision: process.env.T250_STATE_TRANSITION_STANDS_ASIDE === "1" ? "stand-aside" : "hold" };
 }
@@ -455,6 +455,9 @@ const STUB_ATTEMPT = "--aidlc-attempt-id 00000000-0000-4000-8000-000000000001";
 const PROMPTED_PROSE_FAMILIES = new Set([
   "engine worktree discard", "engine worktree merge", "engine worktree purge", "engine swarm finalize",
   "unit land", "engine intent archive", "engine recompose", "engine bolt set-autonomy",
+  // Adding a repo can clone it from the network and changes which repos the
+  // work covers: the host's own Allow prompt is the door before it.
+  "engine intent add-repo",
   "engine state set-construction-checkpoints", "unit claim", "engine gen runners", "engine config set",
   // The knowledge skill names the engine route for `onboard`, because the copy
   // of a document the person named happens at the command layer. Onboarding
@@ -2043,6 +2046,8 @@ describe("t250 Copilot adapter security (fail-open + path confinement)", () => {
       for (const command of [
         "aidlc engine state set-construction-checkpoints disabled",
         "bun .aidlc/tools/aidlc-state.ts set-construction-checkpoints disabled",
+        // The message they asked in beside it, which the setter proves.
+        "aidlc engine state set-construction-checkpoints disabled --message 0a1b2c3d",
       ]) {
         // The setter's own check passes for exactly this value: no second confirmation.
         expect(decision(command, "Construction Checkpoints=disabled"), command).toBe("allow");
@@ -2073,11 +2078,19 @@ describe("t250 Copilot adapter security (fail-open + path confinement)", () => {
         // Not asked for: the host still asks.
         expect(decision(command), command).toBeUndefined();
       }
-      // The person's words beside the switch (--person-words) are still that switch.
+      // The message they asked in beside the switch (--message, the setter proves it) is still that
+      // switch, and so is the words form from before it.
+      expect(decision("aidlc engine config set plan-approval off --message 0a1b2c3d", "plan-approval=off")).toBe("allow");
+      expect(decision("aidlc engine config set plan-approval off --message 0a1b2c3d")).toBeUndefined();
       expect(decision("aidlc engine config set guard.review-freeze off --person-words 'turn the review freeze off'",
         "guard.review-freeze=off")).toBe("allow");
       expect(decision("aidlc engine config set guard.review-freeze off --person-words-file .aidlc-engine/answer-text/answer.txt",
         "guard.review-freeze=off")).toBe("allow");
+      // An engine step that prints the setter's output as it is names --verbatim at the end: the same switch.
+      expect(decision("aidlc engine config set summary-confirmation off --verbatim", "summary-confirmation=off")).toBe("allow");
+      expect(decision("aidlc engine config set summary-confirmation off --message 0a1b2c3d --verbatim",
+        "summary-confirmation=off")).toBe("allow");
+      expect(decision("aidlc engine config set summary-confirmation off --verbatim")).toBeUndefined();
       // Another setting, or the switch with anything else joined to it, keeps the prompt.
       expect(decision("aidlc engine config set depth Minimal")).toBeUndefined();
       expect(decision("aidlc engine config set guard.review-freeze off --global", "guard.review-freeze=off")).toBeUndefined();
@@ -2160,7 +2173,8 @@ describe("t250 Copilot adapter security (fail-open + path confinement)", () => {
           expect(decision("aidlc engine log answers --stage a\\b", shell), String(shell)).toBe("allow");
           expect(decision('aidlc engine log answers --stage "a\\"; calc; \\"b"', shell), String(shell)).toBe("deny");
         }
-        // A tool named for its shell is that shell, wherever the hook runs.
+        // The Copilot CLI's `Bash` gets no allow decision on any host: its own
+        // --allow-tool rules decide.
         const named = (command: string, toolName: string) =>
           shellDecision(runAdapter(s, "guard-tool-call", shellCall(command, "S-ALLOW", toolName))).hookSpecificOutput?.permissionDecision;
         expect(named("aidlc engine knowledge summarize --text-file docs\\notes.txt", "Bash")).toBeUndefined();
@@ -2238,10 +2252,52 @@ describe("t250 Copilot adapter security (fail-open + path confinement)", () => {
           expect(call(`cd ${root}; aidlc engine orchestrate next`, shell, "run_in_terminal", { aidlc_shell: "powershell" }), String(shell)).toEqual({});
           expect(guardShell(), String(shell)).toBeUndefined();
         }
-        expect(call(`cd ${root}; aidlc engine orchestrate next`, undefined, "Bash")).toEqual({});
-        expect(guardShell()).toBeUndefined();
+        // The Copilot CLI names its shell tool `Bash` on every host; on Windows
+        // that tool is PowerShell, so there the cd-led command runs like the
+        // bare one (the rewrite, no permission decision), elsewhere it keeps
+        // today's answer.
+        const cli = call(`cd ${root}; aidlc engine orchestrate next`, undefined, "Bash");
+        if (process.platform === "win32") {
+          expect(cli.hookSpecificOutput?.permissionDecision).toBeUndefined();
+          expect(cli.hookSpecificOutput?.updatedInput?.command).toBe(`cd ${root}; aidlc engine orchestrate next ${STUB_ATTEMPT}`);
+          expect(guardShell()).toBe("powershell");
+        } else {
+          expect(cli).toEqual({});
+          expect(guardShell()).toBeUndefined();
+        }
       } finally {
         rmSync(outside, { recursive: true, force: true });
+      }
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("27m: the Copilot CLI's shell call reaches the plan-approval guard read as PowerShell on Windows, and as POSIX elsewhere", () => {
+    // The CLI hands its shell tool to the PascalCase hooks as `Bash` with the
+    // model's own arguments and no shell field (its own record names the tool
+    // `powershell` on Windows Server, 1.0.103), and on Windows that tool runs
+    // PowerShell. A shell the call names still wins.
+    const s = scratch();
+    try {
+      seedAidlcScripts(s);
+      const guardShell = () => capturedInputs(s.captureDir, "aidlc-plan-approval-guard.ts").at(-1)?.aidlc_shell;
+      const command = "New-Item -ItemType Directory -Force aidlc\\spaces\\default\\intents\\x\\construction\\code-generation | Out-Null";
+      for (const toolName of ["Bash", "bash"]) {
+        runAdapter(s, "guard-tool-call", {
+          hook_event_name: "PreToolUse",
+          session_id: "S-ALLOW",
+          tool_name: toolName,
+          tool_input: { command, description: "Create the code generation folder", mode: "sync", initial_wait: 30 },
+        });
+        expect(guardShell(), toolName).toBe(process.platform === "win32" ? "powershell" : undefined);
+        runAdapter(s, "guard-tool-call", {
+          hook_event_name: "PreToolUse",
+          session_id: "S-ALLOW",
+          tool_name: toolName,
+          tool_input: { command, shell: "C:\\Program Files\\Git\\bin\\bash.exe" },
+        });
+        expect(guardShell(), `${toolName} in Git Bash`).toBeUndefined();
       }
     } finally {
       s.cleanup();
@@ -2271,6 +2327,12 @@ describe("t250 Copilot adapter security (fail-open + path confinement)", () => {
           // as a later run recorded them, with / and + in the words
           'bun .aidlc/tools/aidlc.ts engine log decision --stage requirements-analysis --decision "Q1,Q2,Q3,Q4" --options "Q1: Inclusive end / exclusive+day-after / inclusive-for-total-only / parameterized / Other; Q2: date-only / may-carry-time / mixed-normalize / Other; Q3: filter.ts only / review-others / broader-rework / Other; Q4: regression-test / test+manual / no-new-test / Other"',
           'bun .aidlc/tools/aidlc.ts engine log answer --stage requirements-analysis --details "Q1: A (inclusive end); Q2: A (date-only, plain inclusive comparison); Q3: A (filter.ts only, AssetApi untouched); Q4: A (add targeted regression test, keep existing tests green)"',
+          // a question whose choice holds a comma, one --option a choice, as the
+          // protocol shows it: no | for cmd to read, and `A:` is text, not a drive
+          "bun .aidlc/tools/aidlc.ts engine log decision --stage requirements-analysis --decision 'Q3: how should formatPrice(0) read?' --option 'Show zero, with tax' --option 'A: hide it' --option 'Other'",
+          // one whose question or a choice holds a $ or a backtick: both in files
+          // the agent wrote, so nothing on the line is left to ask about
+          "bun .aidlc/tools/aidlc.ts engine log decision --stage requirements-analysis --decision-file .aidlc-engine/answer-text/question.txt --options-file .aidlc-engine/answer-text/options.txt",
         ]) expect(decision(command, shell), `${shell}: ${command}`).toBe("allow");
         // Lettered options, which Windows would read as a path on drive A:.
         expect(decision('aidlc engine log decision --stage requirements-analysis --decision "Q3?" --options "A: yes only fix the end,B: also change start,Other"', shell), String(shell)).toBe("allow");
@@ -2292,6 +2354,9 @@ describe("t250 Copilot adapter security (fail-open + path confinement)", () => {
           "aidlc engine log answer --stage requirements-analysis --details (calc)",
           "aidlc engine log answer --stage requirements-analysis --details a;calc",
           'aidlc engine log answer --stage requirements-analysis --details "a $(calc) b"',
+          // a $ in either quotes (test 30), and a backtick, still keep the prompt
+          "bun .aidlc/tools/aidlc.ts engine log decision --stage requirements-analysis --decision 'Q3?' --option 'Show $0.00, with tax' --option 'Hide it'",
+          "aidlc engine log answer --stage requirements-analysis --details 'a `calc` b'",
           'aidlc engine log answer --stage requirements-analysis --details "100% (of it)"',
           'aidlc engine log answer --stage requirements-analysis --details "a ^& b"',
         ]) expect(decision(command, shell), `${shell}: ${command}`).not.toBe("allow");

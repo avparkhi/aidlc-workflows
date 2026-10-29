@@ -1,7 +1,7 @@
 // t255-workspace-sync: aidlc-workspace-sync reconciles a workspace root against
 // an optional repos.json manifest, idempotently and without ever destroying work.
 //
-// covers: file:core/tools/aidlc-workspace-sync.ts
+// covers: file:core/tools/aidlc-workspace-sync.ts, function:renameRetryingOnWindows
 //
 // The orphan-safety coverage is the load-bearing part: a reconcile tool that
 // clones and removes sibling repos must never delete unrecoverable work.
@@ -26,7 +26,7 @@ import {
   remainingOperationTimeoutMs,
 } from "../harness/test-budget.ts";
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -39,6 +39,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -46,9 +47,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, relative } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseWorkspaceManifest } from "../../core/tools/aidlc-workspace-manifest.ts";
-import { maskUserinfo } from "../../core/tools/aidlc-workspace-sync.ts";
+import { maskUserinfo, renameRetryingOnWindows } from "../../core/tools/aidlc-workspace-sync.ts";
 
 // Real git repos + bare remotes + a shimmed sleep 1 per case exceed bun's 5s default under load.
 setDefaultTimeout(NATIVE_MULTI_WORKTREE_CASE_TIMEOUT_MS);
@@ -639,9 +640,25 @@ describe("t255 workspace-sync - reconcile checkout against repos.json", () => {
     const gi = readFileSync(join(ws, ".gitignore"), "utf-8");
     expect(gi).toContain("# >>> aidlc workspace-sync managed");
     expect(gi).toContain("\n/.aidlc-workspace-sync-recovery-*/\n");
+    // The staging folder a clone cut off by a host timeout leaves behind.
+    expect(gi).toContain("\n/.aidlc-workspace-sync-txn-*/\n");
     expect(gi).toContain("\n/checkout-api/\n");
     expect(gi).toContain("\n/checkout-web/\n");
     expect(gi).toContain("# <<< aidlc workspace-sync managed <<<");
+  });
+
+  test("a repo folder named with a space gets its own managed line, which git reads as that folder", () => {
+    const ws = freshWorkspace('{ "org": "acme", "repos": [{ "name": "my lib" }] }', ["my lib"]);
+    expect(runSync(ws).status).toBe(0);
+    expect(readFileSync(join(ws, ".gitignore"), "utf-8")).toContain("\n/my lib/\n");
+    git(ws, "init", "-q");
+    writeFileSync(join(ws, "my lib", "a.txt"), "x\n", "utf-8");
+    writeFileSync(join(ws, "my libs.txt"), "x\n", "utf-8");
+    const ignored = (path: string) => spawnSync("git", ["-C", ws, "check-ignore", "-q", path], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+    }).status;
+    expect(ignored("my lib/a.txt")).toBe(0);
+    expect(ignored("my libs.txt")).toBe(1);
   });
 
   test("is idempotent and preserves hand-owned lines outside the gates", () => {
@@ -1179,11 +1196,11 @@ describe("t255 workspace-sync - reconcile checkout against repos.json", () => {
     const cases = [
       {
         repos: [{ name: "../escaped", url: "/does/not/matter" }],
-        message: "single path segment",
+        message: "its name is not one folder's name",
       },
       {
         repos: [{ name: "nested/repo", url: "/does/not/matter" }],
-        message: "single path segment",
+        message: "its name is not one folder's name",
       },
       {
         repos: [{ name: "same" }, { name: "same" }],
@@ -1787,5 +1804,159 @@ describe("t255 workspace-sync - reconcile checkout against repos.json", () => {
     expect(r.status).toBe(1);
     expect(r.out).toContain("url");
     expect(r.out).toContain("checkout-api");
+  });
+});
+
+// Windows refuses to rename a folder while another program has a file in it
+// open; the move waits a few seconds for it to let go, and never over a target
+// that is already there.
+describe("t255 workspace-sync - a folder move on Windows", () => {
+  test.skipIf(process.platform !== "win32")(
+    "on Windows a move waits for a program holding a file inside to let go, and never retries over an existing target",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "aidlc-t255-move-"));
+      tmpRoots.push(root);
+      const held = join(root, "staged");
+      mkdirSync(join(held, "src"), { recursive: true });
+      const file = join(held, "src", "api.ts");
+      writeFileSync(file, "export const api = 1;\n", "utf-8");
+      const opened = join(root, "opened");
+      const holder = (path: string, ms: number) => {
+        const child = spawn("powershell", [
+          "-NoProfile",
+          "-Command",
+          `$f = [IO.File]::Open('${path}', 'Open', 'Read', 'Read'); New-Item -ItemType File '${opened}' | Out-Null; ` +
+            `Start-Sleep -Milliseconds ${ms}; $f.Close()`,
+        ]);
+        return new Promise<void>((done) => child.on("exit", () => done()));
+      };
+
+      const released = holder(file, 1_000);
+      await waitForPath(opened);
+      expect(() => renameSync(held, join(root, "plain"))).toThrow();
+      renameRetryingOnWindows(held, join(root, "installed"));
+      expect(existsSync(join(root, "installed", "src", "api.ts"))).toBe(true);
+      await released;
+
+      rmSync(opened, { force: true });
+      const target = join(root, "taken");
+      mkdirSync(join(target, "kept"), { recursive: true });
+      const releasedAgain = holder(join(root, "installed", "src", "api.ts"), 2_000);
+      await waitForPath(opened);
+      const started = Date.now();
+      expect(() => renameRetryingOnWindows(join(root, "installed"), target)).toThrow();
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(existsSync(join(target, "kept"))).toBe(true);
+      await releasedAgain;
+    },
+  );
+});
+
+// Another sync, a second chat or another computer can put a file or a clone at
+// a name between this sync's look and its install. Nothing of theirs is
+// replaced; this sync rolls back and says what happened in one line.
+describe("t255 workspace-sync - another writer at the moment of install", () => {
+  // Runs the tool in a child whose node:fs puts the other writer's file or
+  // folder in place at the named moment, then lets the real call meet it.
+  function syncWithWriter(ws: string, moment: "claim" | "clone-move"): { status: number; out: string } {
+    const r = spawnSync(BUN, ["--eval", `
+      import { mock } from "bun:test";
+      import { basename, join } from "node:path";
+      const fs = { ...await import("node:fs") };
+      let done = false;
+      const other = (path, write) => {
+        if (done) return;
+        done = true;
+        write(String(path));
+      };
+      mock.module("node:fs", () => ({
+        ...fs,
+        openSync(path, flags, ...rest) {
+          if (${JSON.stringify(moment)} === "claim" && flags === "wx" && basename(String(path)) === ".gitignore") {
+            other(path, (p) => fs.writeFileSync(p, "# theirs\\n"));
+          }
+          return fs.openSync(path, flags, ...rest);
+        },
+        linkSync(from, to) {
+          if (${JSON.stringify(moment)} === "claim" && basename(String(to)) === ".gitignore") {
+            other(to, (p) => fs.writeFileSync(p, "# theirs\\n"));
+          }
+          return fs.linkSync(from, to);
+        },
+        renameSync(from, to) {
+          if (${JSON.stringify(moment)} === "clone-move" && basename(String(to)) === "checkout-api" &&
+              String(from).includes("clones")) {
+            other(to, (p) => { fs.mkdirSync(p); fs.writeFileSync(join(p, "theirs"), "x"); });
+          }
+          return fs.renameSync(from, to);
+        },
+      }));
+      const sync = await import(${JSON.stringify(pathToFileURL(SCRIPT).href)});
+      sync.main(["--project-dir", ${JSON.stringify(ws)}]);
+    `], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      cwd: ws,
+      encoding: "utf-8",
+      env: GIT_ENV,
+    });
+    return { status: r.status ?? -1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+  }
+
+  test("a generated file another writer makes as this sync installs it is kept, and this sync rolls back", () => {
+    const ws = freshWorkspace(MANIFEST);
+    const result = syncWithWriter(ws, "claim");
+    expect(result.status, result.out).toBe(1);
+    expect(result.out).toContain(
+      `${join(realpathSync(ws), ".gitignore")} changed while workspace-sync was staging; no generated files were replaced`,
+    );
+    expect(result.out).not.toContain("EEXIST");
+    expect(readFileSync(join(ws, ".gitignore"), "utf-8")).toBe("# theirs\n");
+    expect(existsSync(join(ws, CODE_WORKSPACE_NAME))).toBe(false);
+  });
+
+  test("a clone another sync puts in place after this sync's look is kept, and this sync rolls back", () => {
+    const sourceWs = freshRealWorkspace('{ "org": "acme", "repos": [] }');
+    const source = makeRepo(sourceWs, "source");
+    const remote = git(source, "remote", "get-url", "origin");
+    const ws = freshRealWorkspace(
+      JSON.stringify({ org: "acme", repos: [{ name: "checkout-api", branch: "main", url: remote }] }),
+    );
+    const result = syncWithWriter(ws, "clone-move");
+    expect(result.status, result.out).toBe(1);
+    expect(result.out).toContain("checkout-api appeared while sync was staging; no changes were applied");
+    expect(result.out).not.toMatch(/ENOTEMPTY|EPERM|EEXIST/);
+    expect(readdirSync(join(ws, "checkout-api"))).toEqual(["theirs"]);
+    expect(existsSync(join(ws, ".gitignore"))).toBe(false);
+    expect(existsSync(join(ws, CODE_WORKSPACE_NAME))).toBe(false);
+  });
+
+  // A sync stopped between claiming a generated file's name and renaming its
+  // bytes over the claim leaves that file empty. The next sync renders from
+  // the empty file, as from a missing one, and keeps the empty one with its
+  // recovery files; the person's own lines from before the stopped sync are in
+  // that sync's .aidlc-workspace-sync-txn-* folder.
+  for (const name of [".gitignore", CODE_WORKSPACE_NAME]) {
+    test(`an empty ${name} a stopped sync left is written whole by the next sync`, () => {
+      const ws = freshWorkspace(MANIFEST);
+      writeFileSync(join(ws, name), "");
+      const result = runSync(ws);
+      expect(result.status, result.out).toBe(0);
+      expect(result.out).toContain("prior generated files retained at");
+      expect(readFileSync(join(ws, ".gitignore"), "utf-8")).toContain("/checkout-api/");
+      expect(JSON.parse(readFileSync(join(ws, CODE_WORKSPACE_NAME), "utf-8")).folders).toEqual([
+        { path: "." }, { path: "checkout-api" }, { path: "checkout-web" },
+      ]);
+      const recovery = readdirSync(ws).find((entry) => entry.startsWith(".aidlc-workspace-sync-recovery-"));
+      const kept = join(ws, recovery!, "generated-file-backups", name === ".gitignore" ? "gitignore" : name);
+      expect(readFileSync(kept, "utf-8")).toBe("");
+    });
+  }
+
+  test("an empty repos.json an add-repo left is never read as no repos, and nothing changes", () => {
+    const ws = freshWorkspace("");
+    const result = runSync(ws);
+    expect(result.status, result.out).toBe(1);
+    expect(result.out).toContain("repos.json is not valid JSON");
+    expect(readdirSync(ws).sort()).toEqual(["checkout-api", "checkout-web", "repos.json"]);
   });
 });

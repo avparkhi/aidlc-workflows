@@ -36,7 +36,7 @@ This applies to **every** structured-question site, including but not limited to
 - the ladder prompt (autonomy mode after the walking skeleton);
 - halt-and-ask on Bolt failure (Retry / Skip / Abort);
 - consolidated-summary confirmation before artifact generation;
-- the §13 learnings gate (keep / heading / promote-to-team).
+- the section 13 learnings question after a correction (keep for this project, for the team, or not).
 
 (Literal ` ```question ` fences legitimately remain in framework documentation
 like THIS file and the stage-protocol because they are authoring specs, not chat
@@ -52,6 +52,11 @@ shipped config flags (`[tools] experimental_request_user_input` +
 `[features] default_mode_request_user_input`). It is the PRIMARY track; the
 prose track below is the permanent floor for sessions where the tool is
 unavailable (flag off, older Codex, headless exec).
+
+On some models Codex also offers `request_user_input_async`. AI-DLC's questions
+use `request_user_input`, not that one: you end the turn at every question, and
+Codex takes an async question off the screen when the turn ends, so the person
+would have no box to answer.
 
 ### Track 1 — request_user_input (when the tool is available)
 
@@ -73,8 +78,9 @@ Map the spec fields 1:1:
   through." (Questions *files* still
   end every question with `X. Other (please specify)` per protocol §3 — the
   file format is harness-neutral.)
-- Limits: 1–3 questions per call, 2–3 options each. For 4+ options, split
-  across calls (options A–C, then D+); the questions file retains the full
+- Limits: 1-3 questions per call, 2-3 options each. A question from the
+  questions file with more options is asked as numbered prose instead
+  (Track 2, stage-protocol.md Step 3a); the questions file retains the full
   option set as the authoritative record.
 - **Answer capture**: the selection returns as the exact option label; record
   it verbatim (protocol: never summarize User Input).
@@ -107,11 +113,11 @@ options:
 becomes:
 
 ```
-**Approval** — [Stage Name] complete. How would you like to proceed?
+**Approval** - [Stage Name] complete. How would you like to proceed?
 
-1. **Approve** — Continue to [next stage]
-2. **Request Changes** — Provide revision feedback
-3. **Other** — describe what you want instead
+1. **Approve** - Continue to [next stage]
+2. **Request Changes** - Provide revision feedback
+3. **Other** - describe what you want instead
 
 Reply with a number (or just tell me).
 ```
@@ -136,11 +142,11 @@ numbered-prose floor, render the bullets right above it in the same message:
 ```
 - <each answer, as a summary bullet>
 
-**Confirm** — Does this all look correct before I generate the artifact?
+**Confirm** - Does this all look correct before I generate the artifact?
 
-1. **Looks correct** — Generate the artifact from these answers
-2. **Request changes** — Revise one or more answers before generation
-3. **Other** — describe what you want instead
+1. **Looks correct** - Generate the artifact from these answers
+2. **Request changes** - Revise one or more answers before generation
+3. **Other** - describe what you want instead
 
 Reply with a number (or just tell me).
 ```
@@ -178,7 +184,6 @@ Rules (both tracks):
   and add the note that it comes after one more revision. Never count the
   rounds yourself.
 - **No emergent options**: render exactly the spec's options (+ the escape).
-  The NO EMERGENT BEHAVIOR rule applies to the rendering, not just the spec.
 - **Prose response keys**: on Track 2, start every question at `1`, independent
   of numbered content earlier in the message or another question in the batch.
   Use unordered bullets for immediately preceding summaries. Visible `1` maps
@@ -202,7 +207,7 @@ Rules (both tracks):
   `select_commands[].selector` and execute that entry's complete `command`
   verbatim; never interpolate a selector. `new-work-routing` carries its routes
   as fields: `new_intent_command` (or a `scope_commands` entry for a corrected
-  scope), `compose_command`, and `continue_command` for the active workflow or,
+  scope; there is none when no plan is proposed), `compose_command`, and `continue_command` for the active workflow or,
   with `available_intents`, per-record `select_commands` and `reshape_commands`. Run them verbatim and
   retain the `--request` id through selection or composition. Existing intents with no selected cursor and
   pending work receive this ask on every harness, including after scope

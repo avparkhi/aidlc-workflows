@@ -299,7 +299,7 @@ builds, and release packaging regenerate before consuming either local root.
 
 ### Markdown structure
 
-`markdownBlocks` in `core/tools/aidlc-lib.ts` is the single Markdown block
+`markdownBlocks` in `core/tools/aidlc-markdown.ts` is the single Markdown block
 interpreter for visibility, containers, link reference definitions, claim
 splitting, and confirmation parsing. It is backed by `Bun.markdown`, the
 CommonMark/GFM renderer built into Bun and into every native `aidlc` binary, so
@@ -599,6 +599,18 @@ variables. Release acquisition and the transaction engine enforce the network
 and mutation boundaries, while a per-session fingerprint cache avoids repeating
 a full retained-version inspection without weakening pin validation.
 
+A route's `all` usage forms are also the one source for the options a public
+command accepts. `routeOptions` reads them, adds the launcher globals the
+route's own `outputModes` and `networkPolicy` admit, and both `aidlc <command>
+--help` and the shell-completion generator render that result, so help and
+completions cannot describe different flags. A flag reachable that way needs a
+one-line meaning in `FLAG_SUMMARIES`, or a per-command one in
+`COMMAND_FLAG_SUMMARIES` where the meaning differs by command, and a flag
+either public parser accepts (`PUBLIC_LIFECYCLE_GRAMMARS` for the lifecycle
+commands, `SIMPLE_PUBLIC_GRAMMARS` for doctor and version) needs a usage form;
+`tests/unit/t230-dispatcher-routes.test.ts` fails on either gap, which is what
+keeps a newly added option out of shipping undocumented.
+
 ### Shared transaction engine
 
 Install-mechanism mutations use `core/tools/aidlc-transaction.ts`. A plan is a
@@ -616,36 +628,57 @@ preserves recovery evidence, and the next transaction quarantines abandoned
 staging rather than deleting it. Project init/refresh, machine lifecycle,
 project pins, plugin selection, and plugin sync all build plans for this engine.
 
-The root lock prefers hard-link publication and falls back automatically to an
-owner-stamped directory when hard links are unavailable. Both use
-`.aidlc-transaction.lock`, so a live legacy file owner still blocks the directory
-fallback. The receipt-managed `withAuditLock` helper supplies a dedicated local
-gate in the temporary directory, keyed by canonical root, around transaction
-execution, including
-acquisition, stale-owner recovery, and ownership-checked release. Recovery
-treats an owner as gone when its PID is dead or now runs a later process: both
-lock forms record the holder's process generation (the OS start record the
-gate's reaper also compares), and a lock from a release that recorded none is
-judged by whether the live process started more than 2 s after the lock was
-written. Each recovery prints one line on stderr. Directory recovery also
-requires a matching host/boot identity; unknown, foreign, or incomplete
-directory owners are retained for manual diagnosis.
+The root lock is one owner-stamped directory, `.aidlc-transaction.lock`, made
+by `mkdir` (exclusive on every storage) and stamped with `owner.json` (`'wx'`,
+then `fsync`); a live file lock an older release took by hard link at the same
+path still blocks it. The receipt-managed `withAuditLock` helper supplies a
+dedicated local gate in the temporary directory, keyed by canonical root, around
+transaction execution, including acquisition, stale-owner recovery, and
+ownership-checked release. Recovery (`clearStaleLock`) treats an owner as gone
+when its PID is dead or now runs a later process: the stamp records the holder's
+process generation (the OS start record the gate's reaper also compares), and a
+lock from a release that recorded none is judged by whether the live process
+started more than 2 s after the lock was written. Each recovery prints one line
+on stderr. The stamp also records a host identity (platform, hostname, boot), a
+machine identity (platform, hostname) and the boot: a stamp from this machine
+under another boot is cleared, since its holder stopped with that boot; one
+from another machine, or one with no machine (an older release's) under another
+host identity, is retained with a `TransactionLockStateError` that names the
+folder to delete once nothing runs there. A stamp that never finished (no owner
+file, an empty one, or one that does not parse) reads as busy
+(`TransactionBusyError`) until the folder is past the workflow locks' unstamped
+grace (5 s by default), and is then cleared; a stamp that parses but names no
+valid owner is retained as unreadable. A live owner, and a lock taken again
+between a dead owner's clearing and this command's `mkdir`, read as busy;
+update's version reservation and plugin sync retry on that class.
 
-The coordination contract covers cooperating processes on one continuously
-running mount on one host with a common local temporary directory (`TMPDIR` on
-Unix), canonical root, and PID namespace. It provides no distributed locking
-between hosts or independent mounts. Moving the gate locally does not change
-the data contract: workflow append and descriptor identity must remain coherent,
-and transaction publication still depends on atomic file replacement and
-directory rename supplied by the filesystem. No copy-and-delete rename
-fallback is added.
+The gate serializes commands that share a local temporary directory; the
+project lock alone keeps apart commands with different temporary directories,
+WSL and Windows on one folder, and computers sharing a folder, because a foreign
+stamp is never cleared. Commands on one computer must share its PID namespace.
+It provides no distributed locking between independent mounts that do not
+share one view of the folder. The data contract is unchanged: workflow append
+and descriptor identity must remain coherent, and transaction publication still
+depends on atomic file replacement and directory rename supplied by the
+filesystem. No copy-and-delete rename fallback is added. A commit rename the
+storage does not support (`ENOTSUP`, `EOPNOTSUPP`, `ENOSYS`) fails as a
+`TransactionFilesystemError` naming the operation, after rollback.
+
+No engine code makes a hard link (`tests/unit/t-no-hard-links-lint.test.ts`).
+Where a name must not be replaced, `installWithoutReplacing` (aidlc-locks.ts)
+claims it with an exclusive create and renames the whole bytes over that claim
+through `replaceAtomically`'s Windows retry; a name taken meanwhile fails with
+`EEXIST`. The document copy and workspace sync's generated files use it, the
+first active-space cursor is one exclusive write, and a space switch renames
+its cursor into place.
 
 `assertTransactionFilesystem` probes exclusive creation, regular-file `fsync`,
 mutable append/readback and descriptor identity, file/directory rename, Unix
-`chmod`, and transaction and runtime workflow locking. The first-run wizard and
-transactions using the directory fallback invoke it; unsupported directory
-`fsync` is tolerated. Successful probes cannot establish crash durability or
-rename atomicity, nor certify a driver through simulated failures. Mountpoint's
+`chmod`, and transaction and runtime workflow locking. The first-run wizard
+invokes it before its first question, and transactions do not repeat it;
+unsupported directory `fsync` is tolerated. Successful probes cannot establish
+crash durability or rename atomicity, nor certify a driver through simulated
+failures. Mountpoint's
 missing directory rename/mutable-file support and s3fs's non-atomic rename
 remain outside the full transaction contract. See the [storage compatibility matrix](../guide/18-install-and-lifecycle.md#transactions-and-recovery).
 
@@ -729,6 +762,7 @@ dist/claude/.claude/
 |   +-- aidlc-operations-agent.md
 +-- knowledge/
 |   +-- aidlc-shared/
+|   |   +-- adding-a-repo.md
 |   |   +-- ai-dlc-principles.md
 |   |   +-- verification.md
 |   |   +-- brownfield.md
@@ -872,9 +906,9 @@ binding then precede the two shared per-user cursors:
 
 - **Space** - precedence `explicit arg > session binding > aidlc/active-space
   cursor > "default"`
-  (`DEFAULT_SPACE`, `core/tools/aidlc-lib.ts:591`; resolver `activeSpace()`,
-  `aidlc-lib.ts:1300`). `listSpaces()` always reports `default` even with
-  nothing on disk (`aidlc-lib.ts:1973`).
+  (`DEFAULT_SPACE` and the resolver `activeSpace()` in
+  `core/tools/aidlc-locks.ts`). `listSpaces()` always reports `default` even
+  with nothing on disk (`core/tools/aidlc-lib.ts`).
 - **Intent** - precedence `explicit arg > session binding >
   aidlc/spaces/<space>/intents/active-intent cursor (if it names a real record
   holding aidlc-state.md) > lone-intent > null`. A `null` intent
@@ -950,9 +984,9 @@ an idle machine, and on a busy one it finishes instead of losing the chat.
 Multiple Kiro IDE chats
 and opencode sessions can still share one process; process ancestry cannot
 distinguish those conversations. AI-DLC's opencode plugin gives each shell
-command its chat as `AIDLC_SESSION_OVERRIDE` (opencode's `shell.env` hook); a
-file write's audit and sensors, and the to-do list sync, still go by the
-process there. Spawned tools with unavailable or ambiguous
+command its chat as `AIDLC_SESSION_OVERRIDE` (opencode's `shell.env` hook), and
+forwards a file write's audit and sensors and the to-do list sync with the chat's
+session id. Spawned tools with unavailable or ambiguous
 ancestry use shared-cursor behavior unless a payload-bearing hook or the harness
 process supplies `AIDLC_SESSION_OVERRIDE`.
 
@@ -987,7 +1021,7 @@ when it was minted), so a clone keeps one shard when the machine's name changes
 or the folder is copied to another machine. Shard files that start with the same
 first row are copies of one file (a sync tool's conflict copy, a hand copy);
 readers read the rows they share once (`copiedAuditBlocks` in
-`core/tools/aidlc-lib.ts`).
+`core/tools/aidlc-record-core.ts`).
 
 ## Key Design Decisions
 
@@ -1013,7 +1047,7 @@ readers read the rows they share once (`copiedAuditBlocks` in
 
 11. **Phase boundary verification** -- Traceability checks run at the end of Ideation, Inception and Construction (the Initialization->Ideation transition has none), written by the phase's last stage to `<record>/verification/`. This catches missing requirements-to-design links, orphaned artifacts, and inconsistencies before downstream stages build on incomplete foundations.
 
-12. **Hook-based audit logging** -- A PostToolUse hook on Write/Edit operations automatically logs artifact creation and modification to the intent's `audit/` shards. A PreCompact hook validates state file structure before context compaction. A SubagentStop hook logs subagent completions. The 123-event taxonomy (defined in `knowledge/aidlc-shared/audit-format.md`; see [State Machine](12-state-machine.md) for the emitter registry) enables post-hoc analysis -- key events include `STAGE_STARTED`, `STAGE_COMPLETED`, `DECISION_RECORDED`, `SCOPE_CHANGED`, and `RULE_LEARNED`.
+12. **Hook-based audit logging** -- A PostToolUse hook on Write/Edit operations automatically logs artifact creation and modification to the intent's `audit/` shards. A PreCompact hook validates state file structure before context compaction. A SubagentStop hook logs subagent completions. The 131-event taxonomy (defined in `knowledge/aidlc-shared/audit-format.md`; see [State Machine](12-state-machine.md) for the emitter registry) enables post-hoc analysis -- key events include `STAGE_STARTED`, `STAGE_COMPLETED`, `DECISION_RECORDED`, `SCOPE_CHANGED`, and `RULE_LEARNED`.
 
 13. **No nested delegation** -- The conductor (SKILL.md) performs every agent Task call. Agents never invoke each other or spawn subagents. This keeps the delegation graph flat and debuggable.
 

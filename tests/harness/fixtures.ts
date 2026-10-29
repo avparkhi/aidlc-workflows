@@ -338,7 +338,7 @@ export function seededAuditDir(proj: string, space = DEFAULT_SPACE): string {
 /**
  * The DETERMINISTIC audit shard path a spawned tool resolves in a fixture
  * project: `<record>/audit/<host-slug>-<FIXTURE_CLONE_ID>.md`. Mirrors
- * auditShardName() in aidlc-lib.ts (hostname slugified + the pinned clone token).
+ * auditShardName() in aidlc-record-core.ts (hostname slugified + the pinned clone token).
  * A test that pre-seeds an audit header or reads a single shard should target
  * THIS path so it agrees with the tool's own resolution.
  */
@@ -382,6 +382,17 @@ export function seedBoltDag(
     )}\n`,
     "utf-8",
   );
+}
+
+// Each Unit's questions for a wave stage, answered in the chat before the wave
+// hands it to a builder: the evidence the engine's hold reads when the summary
+// guard is off (the runner's fixture profile).
+export function seedAnsweredUnitQuestions(proj: string, stage: string, units: readonly string[]): void {
+  for (const unit of units) {
+    const dir = join(seededRecordDir(proj), "construction", unit, stage);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${stage}-questions.md`), "# Questions\n\n## Q1. Who can see a saved item?\n\n[Answer]: Its owner\n", "utf-8");
+  }
 }
 
 /** Seed a Bolt DAG whose topological batches are already known. */

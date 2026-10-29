@@ -5,8 +5,8 @@
 // there (resolveProjectFlag owns that, and nothing here changes it). The
 // person drives: the engine never refuses or re-asks their switch. What it
 // owes them is to say, in plain words, which check is off, since when, how it
-// was set, and the one phrase that turns it back on. Whether a person's chat
-// turn stood behind the change decides only that wording. The record lives in
+// was set, and the one phrase that turns it back on. Whether the command named
+// the person's message decides only that wording. The record lives in
 // the clone's protected runtime directory, and every read or write of it
 // fails open: it can only ever change a sentence.
 import { existsSync, mkdirSync, statSync } from "node:fs";
@@ -14,8 +14,10 @@ import { basename, join, relative, resolve } from "node:path";
 import {
   assertNoSymlinkInChainOrThrow,
   CEREMONY_ENV,
+  CEREMONY_FIELDS,
   getField,
   GUARD_FENCE_ENV,
+  parseCeremonyStateLine,
   readStateFile,
   resolveCeremony,
   resolveFences,
@@ -23,15 +25,15 @@ import {
   SWITCHABLE_GUARD_FENCES,
   delegatedWorktreeIntent,
   isoTimestamp,
-  latestPersonTurn,
   memoryGuardPolicyDeclarations,
   normalizeDriveLetter,
-  personSpokeSinceGate,
   readRegularFileNoFollowOrThrow,
   commandAtPersonsTerminal,
   sessionsDir,
   writeFileAtomic,
+  personsWordsText,
 } from "./aidlc-lib.ts";
+import { proveMessage, type StoredMessage } from "./aidlc-message-store.ts";
 import { aidlcInvocation, quoteCommandArgument } from "./aidlc-runtime-paths.ts";
 import {
   type AidlcSettingsFile,
@@ -59,7 +61,7 @@ export interface RecordedSwitch {
   name: RecordableProjectBypass;
   target: SettingsTarget;
   since: string;
-  // "chat": a person's turn no decision had used was on record when it was set.
+  // "chat": the command named the message the person asked in, proved theirs.
   how: "chat" | "other";
   words?: string;
   // When a directive carried the line, so it is said once per change.
@@ -226,14 +228,16 @@ export type SwitchWayBack = "offer" | "statement" | "command";
  * change something: the whole project after this piece of work, this whole
  * machine after this project. None for a check with no switch of that kind,
  * where the environment decides, where a settings file already keeps it off
- * there (any file, for the project; the machine's, for the machine), or for a
- * command run at the person's own terminal, where no chat is there to answer.
+ * there (any file, for the project; the machine's, for the machine), for a
+ * command run at the person's own terminal, where no chat is there to answer,
+ * or after a piece of work's switch while that work asks nothing more
+ * (workAsksNothing), its state given as `from.work`.
  * The agent relays it as written and, on a yes, sets it there.
  */
 export function widerPlaceOffer(
   projectDir: string,
   name: string | undefined,
-  from: "work" | "project",
+  from: { work: string } | "project",
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
   if (name === undefined || !(PERSON_CHECK_SWITCHES as readonly string[]).includes(name)) return null;
@@ -245,18 +249,32 @@ export function widerPlaceOffer(
       return false;
     }
   };
-  if (from === "work") {
-    return (["local", "project", "global"] as const).some(recordedIn)
+  if (from !== "project") {
+    return workAsksNothing(from.work) || (["local", "project", "global"] as const).some(recordedIn)
       ? null
       : "Do you want it off for the whole project instead?";
   }
   return recordedIn("global") ? null : "Do you want it off for this whole machine instead?";
 }
 
+// True while the person keeps both of a piece of work's own questions off as
+// theirs, the summary confirmation and the learnings step: how the agent
+// records "do not ask me anything" (stage-protocol.md, a choice left to you).
+// Two separate requests that turned both off leave the same record, so they
+// count too. Either one back on, or set by anything but the person, and the
+// work's offers come back.
+function workAsksNothing(stateContent: string): boolean {
+  return (["summary_confirmation", "learnings"] as const).every((key) => {
+    const saved = parseCeremonyStateLine(getField(stateContent, CEREMONY_FIELDS[key]));
+    return saved?.value === "off" && saved.source === "you";
+  });
+}
+
 /**
  * What `config flags --bypass` says for a check the person asked to turn off
  * that a settings file already keeps off at that place: that it is, and the
- * one wider-place offer. Empty for anything else (the command's own line).
+ * one wider-place offer, or that the environment outranks the recording
+ * (overriddenRecordingLine). Empty for anything else (the command's own line).
  */
 export function alreadyOffLines(
   projectDir: string,
@@ -274,9 +292,39 @@ export function alreadyOffLines(
       held = false;
     }
     if (!held) return [];
+    const overridden = overriddenRecordingLine(projectDir, name, label, target, env, true);
+    if (overridden !== null) return [overridden];
     const offer = target === "global" ? null : widerPlaceOffer(projectDir, name, "project", env);
     return [`The ${label}${settingPurpose(label)} is already off ${where(target)}.${offer ? ` ${offer}` : ""}`];
   });
+}
+
+/**
+ * The line for a check the person asked to turn off that a settings file now
+ * records off, while a variable of the switch's name set to anything but 1 is
+ * in the environment: it decides over the files, as resolveProjectFlag reads
+ * it, so the recording does not turn the check off. It never says the check is
+ * on, since the open piece of work can still keep it off, and never prints the
+ * variable's value. Like the switch's own line it ends with the way back,
+ * which from a chat is the whole print. `unchanged`: nothing was written, so
+ * no change line names the clear, and at the person's own terminal this line
+ * names it for the file that records it. Null otherwise.
+ */
+function overriddenRecordingLine(
+  projectDir: string,
+  name: string,
+  label: string,
+  target: SettingsTarget,
+  env: NodeJS.ProcessEnv,
+  unchanged: boolean,
+): string | null {
+  if (!Object.hasOwn(env, name) || env[name] === "1") return null;
+  const back = unchanged && commandAtPersonsTerminal(env)
+    ? `To clear the recording: ${clearSwitchCommand(name as RecordableProjectBypass, projectDir, undefined, target)}`
+    : "You can clear the recording any time.";
+  return `The ${label}${settingPurpose(label)} is recorded off ${where(target)}, but ${name} is set to something ` +
+    "other than 1 in the environment this command ran in, and it decides over the settings files, so the recording " +
+    `does not turn the check off. Start the editor or CLI without ${name} for the recording to turn the check off. ${back}`;
 }
 
 /**
@@ -382,7 +430,7 @@ export function backOnFromChatLines(
 ): string[] | null {
   const unique = [...new Set(names)];
   if (commandAtPersonsTerminal(env) || unique.some((name) => backOnSubject(name) === null)) return null;
-  if (!unique.some((name) => recordedIn(projectDir, name).some((target) => target !== "local"))) return null;
+  if (unique.every((name) => chatTurnsBackOn(recordedIn(projectDir, name)))) return null;
   return unique.map((name) =>
     backOnLine(projectDir, name, true, env) ?? unrecordedSwitchLine(projectDir, name as RecordableProjectBypass, env)
   );
@@ -452,6 +500,14 @@ function recordedIn(projectDir: string, name: string): SettingsTarget[] {
   });
 }
 
+// A chat's yes clears only the person's own aidlc.settings.local.json and
+// leaves the project's shared file and this machine's as they are
+// (backOnLine), so a chat turns a switch back on only when no other file
+// records it. The one owner for the line's offer, its command and the clear.
+function chatTurnsBackOn(files: readonly SettingsTarget[]): boolean {
+  return files.every((target) => target === "local");
+}
+
 // Take one switch out of the person's aidlc.settings.local.json, keeping
 // everything else the file records, the way `config flags --clear-bypass
 // --local` leaves it, and keep the switch record in step. False when the file
@@ -503,10 +559,9 @@ export function switchOffLine(
     ? "You can turn it back on any time."
     : wayBack === "command"
     ? `To turn it back on: ${wayBackCommand(off, files, env)}`
-    // A chat's yes leaves the project's shared file and this machine's as they
-    // are (backOnLine), so where either records the switch the line says what
-    // keeps it off instead of asking what a yes cannot do.
-    : files.some((target) => target !== "local")
+    // Where a chat's yes cannot turn it back on, the line says what keeps it
+    // off instead of asking what a yes cannot do.
+    : !chatTurnsBackOn(files)
     ? keptOffInFiles(off.projectDir!, files, "it")
     : "Do you want it back on?";
   return `The ${label}${settingPurpose(label)} is off ${where(off.target)} since ${since}${how}. ${back}`;
@@ -518,7 +573,7 @@ export function switchOffLine(
 // shared file and this machine's, so each file that keeps it off is named by
 // its place.
 function wayBackCommand(off: SwitchOff, files: readonly SettingsTarget[], env: NodeJS.ProcessEnv): string {
-  return commandAtPersonsTerminal(env) || files.every((target) => target === "local")
+  return commandAtPersonsTerminal(env) || chatTurnsBackOn(files)
     ? clearSwitchCommand(off.name, off.projectDir)
     : files.map((target) => clearSwitchCommand(off.name, off.projectDir, process.platform, target)).join(" and ");
 }
@@ -537,13 +592,41 @@ export function switchesOffLines(
 }
 
 /**
- * The lines the engine's next directive carries: each switch that went off,
- * or was first found off, since a directive last said so.
+ * The agent's own instruction beside a line that offers a check back on, never
+ * part of what the person hears: the one command that turns it back on from a
+ * chat, for a yes to the line or their own words asking for it. It names the
+ * place the line names and a command that names no file, so their "for this
+ * project" is never built into --project, the shared file, which does not hold
+ * it. A chat that opens with that request has made the line untrue, so what the
+ * command prints is said in its place. Null where the line makes no offer.
  */
-export function switchOffNotices(projectDir: string, env: NodeJS.ProcessEnv = process.env): string[] {
+export function backOnInstruction(off: SwitchOff): string | null {
+  if (!chatTurnsBackOn(off.projectDir === undefined ? [] : recordedIn(off.projectDir, off.name))) return null;
+  const label = PERSON_CHECK_SWITCH_LABELS[off.name] ?? off.name;
+  return `If the person wants the ${label} back on ${where(off.target)} (a yes to its line, or their own words), ` +
+    `run exactly this command: ${clearSwitchCommand(off.name, off.projectDir)}, and say what it prints in place of ` +
+    "that line.";
+}
+
+/** The instruction for each switch off whose line offers it back on, for session start. */
+export function backOnInstructions(projectDir: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  return switchesOff(projectDir, env).flatMap((off) => backOnInstruction(off) ?? []);
+}
+
+export interface SwitchOffNotice {
+  line: string;
+  backOn: string | null;
+}
+
+/**
+ * The lines the engine's next directive carries: each switch that went off,
+ * or was first found off, since a directive last said so, each with its
+ * instruction for a yes (backOnInstruction).
+ */
+export function switchOffNotices(projectDir: string, env: NodeJS.ProcessEnv = process.env): SwitchOffNotice[] {
   return switchesOff(projectDir, env)
     .filter((item) => item.entry?.announced === undefined)
-    .map((item) => switchOffLine(item, new Date(), "offer", env));
+    .map((item) => ({ line: switchOffLine(item, new Date(), "offer", env), backOn: backOnInstruction(item) }));
 }
 
 /**
@@ -570,33 +653,42 @@ export function markSwitchOffNoticesSaid(projectDir: string, env: NodeJS.Process
 /**
  * Record how `config flags` changed the switches in one settings file, after
  * the write succeeded, and return what the person should read now: a line for
- * each check it turned off, and one for each it turned back on. A caller that
- * already names the other files still recording a cleared switch passes
- * `otherFiles: false`, so the person reads that once.
+ * each check it turned off, and one for each it turned back on. A check it
+ * recorded off that the environment keeps from turning off gets the line that
+ * says so (overriddenRecordingLine). A caller that already names the other
+ * files still recording a cleared switch passes `otherFiles: false`, so the
+ * person reads that once. `message` is the id the
+ * command named with `--message`, the message the person asked in.
  */
 export function recordSwitchChange(
   projectDir: string,
   target: SettingsTarget,
   previous: AidlcSettingsFile | null,
   next: AidlcSettingsFile | null,
-  { env = process.env, otherFiles = true }: { env?: NodeJS.ProcessEnv; otherFiles?: boolean } = {},
+  { env = process.env, otherFiles = true, message }: {
+    env?: NodeJS.ProcessEnv; otherFiles?: boolean; message?: string;
+  } = {},
 ): string[] {
   const before = new Set<string>(previous?.flags?.bypasses ?? []);
   const after = new Set<string>(next?.flags?.bypasses ?? []);
   const added = PERSON_CHECK_SWITCHES.filter((name) => after.has(name) && !before.has(name));
   const removed = PERSON_CHECK_SWITCHES.filter((name) => before.has(name) && !after.has(name));
   if (added.length === 0 && removed.length === 0) return [];
-  // Their words are behind a switch the agent set from their chat. A command they
-  // ran themselves, at their own terminal, belongs to no chat, so the record
-  // claims none and a later chat quotes no message at them.
-  let turn: ReturnType<typeof latestPersonTurn> = null;
-  if (added.length > 0 && !commandAtPersonsTerminal()) {
+  // Their words are behind a switch the agent set from their chat only through
+  // the message the command named, proved theirs; with none named the record
+  // claims nothing of theirs. A command they ran themselves, at their own
+  // terminal, belongs to no chat, so the record claims none and a later chat
+  // quotes no message at them.
+  let said: StoredMessage | null = null;
+  if (added.length > 0 && message !== undefined && !commandAtPersonsTerminal()) {
     try {
-      turn = personSpokeSinceGate(projectDir) ? latestPersonTurn(projectDir) : null;
+      const proof = proveMessage(projectDir, message, "setting", { request: true, lowers: true });
+      said = "message" in proof ? proof.message : null;
     } catch {
-      turn = null;
+      said = null;
     }
   }
+  const words = said?.words ? personsWordsText(said.words) : null;
   const since = isoTimestamp();
   const changed = new Set<string>([...added, ...removed]);
   const switches = readRecord(projectDir)
@@ -606,9 +698,9 @@ export function recordSwitchChange(
       name,
       target,
       since,
-      how: turn ? "chat" : "other",
+      how: said ? "chat" : "other",
       // Only what the line can show is kept (one more character marks a cut).
-      ...(turn?.words ? { words: turn.words.replace(/\s+/g, " ").trim().slice(0, QUOTE_MAX_CHARS + 1) } : {}),
+      ...(words ? { words: words.replace(/\s+/g, " ").trim().slice(0, QUOTE_MAX_CHARS + 1) } : {}),
     });
   }
   writeRecord(projectDir, switches);
@@ -622,6 +714,11 @@ export function recordSwitchChange(
       const offer = item.target === "global" ? null : widerPlaceOffer(projectDir, item.name, "project", env);
       return offer ? `${line} ${offer}` : line;
     });
+  for (const name of added) {
+    const label = PERSON_CHECK_SWITCH_LABELS[name];
+    const overridden = label === undefined ? null : overriddenRecordingLine(projectDir, name, label, target, env, false);
+    if (overridden !== null) lines.push(overridden);
+  }
   // "On again" only when nothing else still keeps the check off.
   for (const name of removed) {
     const label = PERSON_CHECK_SWITCH_LABELS[name] ?? name;

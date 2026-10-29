@@ -36,6 +36,7 @@ import {
   compiledExecutable,
   discoverProjectHarnesses,
   LinkedFolderError,
+  pinNamedHarness,
   quoteCommandArgument,
   refuseLinkOnTheWay,
   resolveHarnessPath,
@@ -46,6 +47,8 @@ import {
 } from "./aidlc-runtime-paths.ts";
 import {
   executePlan,
+  TransactionBusyError,
+  withTransactionFix,
   transactionState,
   writeOperation,
   type TransactionOperation,
@@ -2188,7 +2191,7 @@ function heldLine(
       : problem.kind === "range"
         ? [
           `needs ${needs(problem.base)}, and ${problem.base.name} ${problem.version} is ${problem.where}`,
-          `Install a ${problem.base.name} version in that range, or a version of ${key} made for ${problem.base.name} ${problem.version}.`,
+          `Install a version of ${problem.base.name} in that range, or a version of ${key} made for ${problem.base.name} ${problem.version}.`,
         ]
         : problem.kind === "include"
         ? [
@@ -2546,8 +2549,7 @@ async function syncPluginsLocked(
     } catch (error) {
       if (
         lockRetry < 3 &&
-        error instanceof Error &&
-        error.message.includes("another AI-DLC mutation holds")
+        error instanceof TransactionBusyError
       ) {
         const lockPath = join(projectDir, ".aidlc-transaction.lock");
         for (
@@ -2639,14 +2641,8 @@ export async function main(argv: string[]): Promise<void> {
       // Kiro IDE's folder-dropped hook names its root here: /bin/sh and
       // cmd.exe, the shells Kiro runs hooks in, set a variable differently.
       if (flags["plugin-root"]) process.env.AIDLC_PLUGIN_ROOT = resolve(flags["plugin-root"]);
-      // A plugin hook names its harness too: a compiled aidlc has already
-      // pinned the first one installed here, which in a project with Claude
-      // Code beside it is .claude.
-      if (flags["harness-dir"]) {
-        process.env.AIDLC_HARNESS_DIR = flags["harness-dir"];
-        delete process.env.AIDLC_HARNESS_NAME;
-        process.env.AIDLC_HARNESS_NAME = runtimeHarnessName(projectDir, flags["harness-dir"]);
-      }
+      // A plugin hook names its harness too.
+      if (flags["harness-dir"]) pinNamedHarness(projectDir, flags["harness-dir"]);
       const result = await syncPlugins(projectDir, argv);
       const message = `plugin sync complete: ${result.synced.length} plugin(s)` +
         (result.pruned.length > 0 ? `; pruned ${result.pruned.length} missing plugin(s)` : "") +
@@ -2658,7 +2654,7 @@ export async function main(argv: string[]): Promise<void> {
     }
     throw new Error("usage: aidlc engine plugin <list|sync [--prune-missing]>");
   } catch (error) {
-    const message = errorMessage(error);
+    const message = withTransactionFix(error, errorMessage(error));
     const code = error instanceof PluginUsageError ? 2 : 1;
     if (flags.json === "true") process.stdout.write(jsonEnvelope(code, message, null));
     else process.stderr.write(`aidlc engine plugin: ${message}\n`);

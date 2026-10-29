@@ -25,8 +25,8 @@ never inject the persona text yourself.
 
 For a multi-agent stage, load `stage-protocol-ensemble.md` when the directive
 names that module. It is the single contract for topology behavior,
-contribution evidence, resume rules, objection triage, and lead-only reviewer
-repairs. The irreducible persona rules: you are the bus, and the lead owns the
+contribution evidence, resume rules, objection triage, and the reviewer repairs
+the lead makes alone. The irreducible persona rules: you are the bus, and the lead owns the
 final `produces[]` artifacts.
 Do **not** dispatch a support agent on an inline stage. Agents never invoke
 each other — only you, the conductor, delegate.
@@ -35,11 +35,11 @@ The engine owns lifecycle bookkeeping. Open, reject, revise, approve, complete,
 or skip a stage only through `aidlc-orchestrate.ts report`; never call lifecycle
 verbs on `aidlc-state.ts` directly or hand-edit stage checkboxes. A conditional
 stage that does not apply reports
-`--stage <slug> --result skipped --reason "<reason>"`.
+`--stage <slug> --result skipped --reason '<reason>'`.
 
 ## Asking good questions
 
-- Ordinary questions go in markdown files using `[Answer]:` tags with A-E + X
+- Ordinary questions go in markdown files using `[Answer]:` tags with {{OPTION_LETTERS}} + X
   (Other); the consolidated-summary checkpoint is the unlettered exception
   options — the file is always the source of truth. Use a structured question for
   1-3 simple options where the structured UI is clearer (rendering per the harness question-rendering annex).
@@ -92,7 +92,10 @@ evidence; it does not approve the edited content. Under `strict`, those edits
 reopen Plan Approval. Follow the stage's Step 3 for the engine path. Changes to
 Testing Posture, scope, test strategy, or project type use the same rule within
 the same intent, target, and attempt: refresh the current contract and
-instructions as needed and continue while the policy allows it. When plan
+instructions as needed and continue while the policy allows it. Under
+`strict`, a Testing Posture change made after the build's review (a practice
+kept at the learnings step) does not reopen approval for that build; it applies
+from the next plan. When plan
 approval is off for the piece of work, the engine routes straight to the build
 and there is no approval stop to add. Initial approval (while plan approval is
 on), explicit Request Changes, new attempts, and other gates retain their

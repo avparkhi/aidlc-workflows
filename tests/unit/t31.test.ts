@@ -54,7 +54,7 @@ afterAll(() => {
 // Every emit-success case runs against a workspace with a RESOLVABLE active
 // intent — createTestProject seeds the per-intent record dir + active-intent
 // cursor, but the cursor only resolves once an aidlc-state.md exists in that
-// record (activeIntent gates on the state file, aidlc-lib.ts). So we seed one.
+// record (activeIntent gates on the state file, aidlc-record-core.ts). So we seed one.
 // aidlc-log refuses to emit when no active workflow resolves (the null-intent
 // guard — see the "no active workflow" describe block below), which is exactly
 // the path aidlc-log is exercised on: orchestrator-called mid-stage, after a
@@ -615,7 +615,7 @@ describe("t31 (u) the parser names the flag, and the policy decision finds its s
     const r = log(["answer", "--stage", "feasibility", "--answer", "yes please"], proj());
     expect(r.status).toBe(1);
     const message = refusal(r);
-    expect(message).toMatch(/^Cannot record this answer: "--answer" is not an option of log answer\. It takes --[a-z-]+(, --[a-z-]+)*\. /);
+    expect(message).toMatch(/^Cannot record this answer: "--answer" is not an option of log answer\. It takes --[a-z.-]+(, --[a-z.-]+)*\. /);
     expect(message).toContain("--details");
     expect(message).toContain(`If "--answer" is part of a value that a bare double quote split: ${howToPass("--details", RUN_TODO)}`);
     expect(message).not.toContain("so it is probably part of a value");

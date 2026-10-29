@@ -76,6 +76,11 @@
 //      The shim hands the core hook the line rebuilt from that structure, and
 //      only when the installed file with those words equals the prompt's body
 //      byte for byte (copilotSkillInvocationLine).
+//  11. The CLI hands a Stop block's reason back to the agent as a new prompt,
+//      with the same keys as a typed one (live-captured on 1.0.103). The Stop
+//      case keeps a digest of the reason it sent for that chat and the chat's
+//      next prompt spends it: an exact match is the host's turn, never the
+//      person's message or reply (armStopNote, spendStopNote).
 //
 // Wiring (.github/hooks/aidlc.json, emitted by harness/copilot/emit.ts) is
 // matcher-FREE by design: VS Code parses but IGNORES matchers, so a matcher
@@ -126,10 +131,12 @@ import {
   resolveWorkflowSelection,
   noteHelperSession,
   runHookHere,
+  sessionsDir,
   settleCopilotCommand,
   settleCopilotIntentBoundary,
   stateFilePath,
   stateFilePathForSelection,
+  validSessionId,
 } from "../tools/aidlc-lib.ts";
 import { appendCoordinationStoodAside, appendSubagentPromptUnmatched } from "../tools/aidlc-audit.ts";
 import { keptRestartRun } from "../tools/aidlc-question-store.ts";
@@ -149,8 +156,9 @@ interface CopilotHookInput {
   reason?: string;
   tool_name?: string;
   toolName?: string;
-  tool_input?: Record<string, unknown>;
-  toolInput?: Record<string, unknown>;
+  tool_input?: unknown;
+  toolInput?: unknown;
+  toolArgs?: unknown;
   tool_result?: unknown; toolResult?: unknown; tool_response?: unknown; toolResponse?: unknown;
   tool_use_id?: string; toolUseId?: string; tool_call_id?: string; toolCallId?: string;
   agent_name?: string;
@@ -229,6 +237,26 @@ function skillArguments(body: string, prompt: string): string | null {
   return pieces.join(args) === region ? args : null;
 }
 
+// The tool's input as an object. The CLI's native camelCase hook payload carries
+// the arguments as toolArgs, a JSON string (the PascalCase hooks AI-DLC
+// registers get tool_input). The Copilot runtime's apply_patch is a freeform tool
+// whose input is the patch text itself (the runtime's own reader takes a string
+// first, then {input} or {patch}), so text that is no JSON object travels as
+// `input`, where applyPatchTargets reads it.
+function toolInputOf(value: unknown): Record<string, unknown> | undefined {
+  const asObject = (v: unknown): Record<string, unknown> | undefined =>
+    v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
+  if (typeof value !== "string") return asObject(value);
+  if (value.length === 0) return undefined;
+  try {
+    const parsed = asObject(JSON.parse(value));
+    if (parsed) return parsed;
+  } catch {
+    // Not JSON: the patch text itself.
+  }
+  return { input: value };
+}
+
 export async function run(
   target: string,
   input: string,
@@ -271,12 +299,15 @@ export async function run(
     copilot.agent_type ?? copilot.agent_name ?? copilot.agentName ?? "";
   const explicitSubagentId = copilot.agent_id ?? copilot.agentId ?? "";
   const subagentId = explicitSubagentId || sessionId;
-  const nativeToolInput = copilot.tool_input ?? copilot.toolInput;
+  const nativeToolInput = toolInputOf(copilot.tool_input ?? copilot.toolInput ?? copilot.toolArgs);
 
   // Canonicalize the tool name across the two surfaces. The CLI sends
   // Claude-style names (Bash/Write/Edit/Read — live-captured); VS Code agent
   // mode uses its own snake_case execution ids (extracted from the shipped
   // extension's equivalence sets — parser-verified, pending a live IDE run).
+  // The Copilot runtime's own names (powershell, grep, view, glob, apply_patch)
+  // are the ones its agent sees, and what a host that does not rename them,
+  // such as the GitHub Copilot app, may send; pwsh is PowerShell 7's name.
   // Unknown names pass through unmapped and fall out of the self-filters,
   // exactly like any foreign tool.
   const TOOL_ALIAS: Record<string, string> = {
@@ -285,6 +316,8 @@ export async function run(
     runTerminalCommand: "Bash",
     bash: "Bash",
     local_shell: "Bash",
+    powershell: "Bash",
+    pwsh: "Bash",
     // writes/creates
     create_file: "Write",
     createFile: "Write",
@@ -316,6 +349,7 @@ export async function run(
     file_search: "Glob",
     fileSearch: "Glob",
     glob: "Glob",
+    grep: "Grep",
     grep_search: "Grep",
     grepSearch: "Grep",
     semantic_search: "Grep",
@@ -333,6 +367,8 @@ export async function run(
     "ask_questions",
     "askQuestion",
     "ask_question",
+    // ask_user as Copilot CLI hands it to the PascalCase hooks AI-DLC registers.
+    "AskUserQuestion",
   ]);
   const rawToolName = copilot.tool_name ?? copilot.toolName ?? "";
   const toolName = TOOL_ALIAS[rawToolName] ?? rawToolName;
@@ -535,13 +571,16 @@ export async function run(
   const PLAIN_WORD = `(?:[A-Za-z0-9_./:=,+-]+${PLAIN_QUOTED}?|${PLAIN_QUOTED})`;
   const PLAIN_COMMAND = new RegExp(`^ *${PLAIN_WORD}(?: +${PLAIN_WORD})* *$`);
   // The shell the command runs in. A shell the call names wins, so Git Bash
-  // or WSL on Windows keeps the POSIX reading; a tool named for its shell
-  // (`powershell`, `bash`) is that shell; VS Code's terminal tool runs the
-  // terminal's default shell, PowerShell or cmd on Windows.
+  // or WSL on Windows keeps the POSIX reading; a tool named `powershell` is
+  // that shell; VS Code's terminal tool runs the terminal's default shell,
+  // PowerShell or cmd on Windows; and the CLI hands its shell tool to these
+  // hooks as `Bash` on every host, which on Windows is PowerShell (the CLI's
+  // own record names that tool `powershell`).
   const terminalShell = typeof nativeToolInput?.shell === "string" ? nativeToolInput.shell.trim() : "";
   const windowsTerminal = terminalShell
     ? /(?:^|[\\/])(?:pwsh|powershell|cmd)(?:\.exe)?$/i.test(terminalShell)
-    : /^(?:pwsh|powershell)$/i.test(rawToolName) || (VSCODE_SHELL_TOOLS.has(rawToolName) && platform() === "win32");
+    : /^(?:pwsh|powershell)$/i.test(rawToolName) ||
+      ((VSCODE_SHELL_TOOLS.has(rawToolName) || /^bash$/i.test(rawToolName)) && platform() === "win32");
   // PowerShell itself: cmd never splits a command line at `;`.
   const powerShellTerminal = windowsTerminal && !/(?:^|[\\/])cmd(?:\.exe)?$/i.test(terminalShell);
   // The plan-approval guard reads a PowerShell command the way PowerShell runs
@@ -593,8 +632,9 @@ export async function run(
     }
   }
   // The person's words in a recorded answer or decision are text, never a
-  // path: on Windows `--options "A: yes,B: no"` would read as drive A:.
-  const FREE_TEXT_FLAGS = new Set(["--options", "--details", "--decision", "--reason"]);
+  // path: on Windows `--options "A: yes,B: no"` would read as drive A:, and so
+  // would one choice of a question given as `--option 'A: yes, fix the end'`.
+  const FREE_TEXT_FLAGS = new Set(["--options", "--option", "--details", "--decision", "--reason"]);
   // So are the words a setter is handed as the reply that asked for it
   // (`--person-words '/aidlc turn the review freeze off'`), on the commands
   // that take them and can run without a click (`scope change` always keeps
@@ -779,20 +819,24 @@ export async function run(
       // Onboarding and sync run the extractor the project's harness names.
       case "knowledge": return verb === "onboard" || verb === "sync";
       // One of the person's checks switched as they asked runs click-free when
-      // the setter would carry it out (on always, off once they asked since the
-      // last decision), with or without their words beside it (--person-words, or
-      // --person-words-file for words in a file);
-      // any other setting keeps the prompt.
-      case "config":
+      // they asked since the last decision (on always), with or without the
+      // message they asked in beside it (--message, which the setter proves), or
+      // the words form from before it (--person-words, --person-words-file),
+      // and with the --verbatim an engine step ends it with; any other setting
+      // keeps the prompt.
+      case "config": {
+        const own = rest.at(-1) === "--verbatim" ? rest.slice(0, -1) : rest;
         return verb === "set" && !(
-          (rest.length === 2 || (rest.length === 4 && (rest[2] === "--person-words" || rest[2] === "--person-words-file"))) &&
-          personCheckSwitchAllowed(projectDir, rest[0], rest[1])
+          (own.length === 2 ||
+            (own.length === 4 && (own[2] === "--message" || own[2] === "--person-words" || own[2] === "--person-words-file"))) &&
+          personCheckSwitchAllowed(projectDir, own[0], own[1])
         );
+      }
       // Turning Construction checkpoints on or off runs click-free when the
       // setter's own check passes (the person asked for it since the last
       // decision, or chose it); without that it keeps the prompt.
       case "state-passthrough":
-        if (verb === "set-construction-checkpoints" && rest.length === 1 &&
+        if (verb === "set-construction-checkpoints" && (rest.length === 1 || (rest.length === 3 && rest[1] === "--message")) &&
           constructionPolicyChangeAllowed(projectDir, "Construction Checkpoints", rest[0])) return false;
         if (ENGINE_OWNED_STATE_TRANSITIONS.has(verb)) return stateTransitionStandsAside();
         return GATE_SETTERS_KEEP_PROMPT.has(verb);
@@ -1201,6 +1245,11 @@ export async function run(
         : { status: "unrelated", ...uncopied };
     }
     const subArgs = normalized.slice(1);
+    // A receipt can start with `-`, so the agent may mark it with `--`, as the
+    // engine reads it (handleContinue). The claim still hashes the line as
+    // typed, the line the engine hashes.
+    const marked = commandKind === "continue" && subArgs[0] === "--";
+    const receiptArgs = marked ? subArgs.slice(1) : subArgs;
     // Read-only next returns a terminal print before workflow inspection and
     // touches no engine marker on other harnesses. Claiming it here advanced
     // engine_sequence, so Stop demanded a fresh bare next after a query (#1258).
@@ -1211,7 +1260,7 @@ export async function run(
     }
     // A bare `continue` (the receipt lost) is claimed too: the engine answers it
     // as `next`, as it does on every harness, instead of a shell-shape refusal.
-    if (commandKind === "continue" && subArgs.length > 1) {
+    if (commandKind === "continue" && receiptArgs.length > 1) {
       return { status: "unsupported", reason: `\`continue\` takes only the receipt from the last step, so this did not run. Run \`${form("next")}\` to get the current step again.` };
     }
     // --person-asked (the person asked to stop) is the one park option.
@@ -1246,16 +1295,18 @@ export async function run(
         !argumentsStayInProject(runs),
       // On a `next` line right after the verb, ahead of the person's words,
       // where the engine reads it; behind them it would be one of their words.
-      // The other verbs carry no words of theirs, so it goes at the end.
+      // On a `continue` marked with `--` it goes there too: behind the mark
+      // the engine would not take it. The other lines carry no words of
+      // theirs, so it goes at the end.
       rewrite: (selectedAttemptId) =>
-        respelled(commandKind === "next" ? parsed.ends[verbWord] : parsed.body.length, selectedAttemptId),
+        respelled(commandKind === "next" || marked ? parsed.ends[verbWord] : parsed.body.length, selectedAttemptId),
       ...uncopied,
       claim: {
         sessionId,
         ...(attemptId ? { attemptId } : {}),
         commandKind: commandKind as CopilotCommandClaim["commandKind"],
         commandSha256: digest,
-        ...(commandKind === "continue" && subArgs.length === 1 ? { continueToken: subArgs[0] } : {}),
+        ...(commandKind === "continue" && receiptArgs.length === 1 ? { continueToken: receiptArgs[0] } : {}),
         ...(commandKind === "next" && nextTakes("--resume") ? { resumeRequest: true } : {}),
         ...(commandKind === "next" && (nextTakes("--stage") || nextTakes("--phase")) ? { jumpRequest: true } : {}),
         ...(commandKind === "next" && nextTakes("--new-intent") ? { startFreshRequest: true } : {}),
@@ -1408,7 +1459,9 @@ export async function run(
     add(toolInput.path);
     add(toolInput.file_path);
     add(toolInput.filePath);
-    for (const key of ["files", "filePaths", "replacements"] as const) {
+    // The Copilot runtime's grep takes `paths`: one folder, or a list of them.
+    add(toolInput.paths);
+    for (const key of ["files", "filePaths", "paths", "replacements"] as const) {
       const values = toolInput[key];
       if (Array.isArray(values)) {
         for (const value of values) add(value);
@@ -1450,6 +1503,7 @@ export async function run(
       filePath: _camelFilePath,
       files: _files,
       filePaths: _filePaths,
+      paths: _paths,
       replacements: _replacements,
       ...rest
     } = toolInput;
@@ -1870,22 +1924,32 @@ export async function run(
   // "briefing" spends the matching launch's record; "unknown" means the
   // record could not be read even under the lock. A VS Code launch from
   // another chat never matches: its brief arrives under that chat's session.
-  // The record spent is kept in spentBriefing for the caller.
+  // The record spent is kept in spentBriefing for the caller. When the prompt
+  // matched none, briefDueHere says whether a launch from this chat still waits
+  // for a brief that comes into it: only VS Code's runSubagent records name the
+  // chat. Null when the record was not read.
   let spentBriefing: BriefingEntry | null = null;
+  let briefDueHere: boolean | null = null;
   function checkBriefing(prompt: unknown): "briefing" | "not-briefing" | "unknown" {
     if (typeof prompt !== "string" || prompt.trim().length === 0) return "not-briefing";
     const digest = briefingDigest(prompt);
     const matches = (entry: BriefingEntry): boolean =>
       entry.digests.includes(digest) && (!entry.session || !sessionId || entry.session === sessionId);
+    const dueHere = (entries: BriefingEntry[]): boolean =>
+      Boolean(sessionId) && entries.some((entry) => entry.session === sessionId);
     const spent = transactBriefings((entries) => {
       const index = entries.findIndex(matches);
       if (index >= 0) spentBriefing = entries.splice(index, 1)[0];
+      else briefDueHere = dueHere(entries);
       return { value: index >= 0, changed: index >= 0 };
     }, true);
     if (spent.read) return spent.value ? "briefing" : "not-briefing";
     // The lock stayed busy or the read failed under it: one plain read.
     try {
-      return liveBriefings(true).some(matches) ? "briefing" : "not-briefing";
+      const entries = liveBriefings(true);
+      if (entries.some(matches)) return "briefing";
+      briefDueHere = dueHere(entries);
+      return "not-briefing";
     } catch {
       return "unknown";
     }
@@ -1948,6 +2012,54 @@ export async function run(
     }
   }
 
+  // The Stop note record (difference #11): the digest of the last block reason
+  // sent to a chat, beside that chat's other per-session files. Only the digest
+  // is kept, never the text.
+  function stopNotePath(chat: string): string {
+    const valid = validSessionId(chat);
+    return valid ? join(sessionsDir(projectDir), `${valid}.copilot-stop-note`) : "";
+  }
+
+  // Without a record the note, when it comes back, counts as the person's.
+  function armStopNote(chat: string, reason: string): void {
+    const path = stopNotePath(chat);
+    if (!path) return;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, briefingDigest(reason), "utf-8");
+    } catch {
+      // The Stop goes out as it is.
+    }
+  }
+
+  // Whether `prompt` is the note this chat's last Stop sent. Every prompt in the
+  // chat spends the record, matched or not. A record that cannot be read, or
+  // cannot be spent, is no match: the prompt is the person's.
+  function spendStopNote(chat: string, prompt: unknown): boolean {
+    const path = stopNotePath(chat);
+    if (!path) return false;
+    let recorded: string;
+    try {
+      recorded = readFileSync(path, "utf-8").trim();
+    } catch {
+      return false;
+    }
+    let spent = false;
+    try {
+      rmSync(path, { force: true });
+      spent = true;
+    } catch {
+      try {
+        writeFileSync(path, "", "utf-8");
+        spent = true;
+      } catch {
+        // Neither: the digest stays, so it must not count now either.
+      }
+    }
+    return spent && recorded.length > 0 && typeof prompt === "string" && prompt.trim().length > 0 &&
+      recorded === briefingDigest(prompt);
+  }
+
   // --- Targets ----------------------------------------------------------------
 
   switch (target) {
@@ -2002,23 +2114,40 @@ export async function run(
     }
 
     case "record-human-turn": {
+      const delivered = copilot.prompt ?? copilot.user_prompt ?? copilot.message ?? "";
+      // The note this chat's last Stop sent, handed back by Copilot (difference
+      // #11): the host's turn, so the core hook keeps nothing of the person's,
+      // and the human sequence stays where it is.
+      if (spendStopNote(coreSessionId, delivered)) {
+        runCore(
+          "aidlc-record-human-turn.ts",
+          JSON.stringify({
+            hook_event_name: "UserPromptSubmit",
+            session_id: coreSessionId,
+            prompt: delivered,
+            origin: { kind: "host", reason: "copilot stop hook reason", source: "record" },
+          }),
+        );
+        return 0;
+      }
       // A skill the person invoked by its slash name is read as their own line
       // (copilotSkillInvocationLine) before anything else looks at the prompt.
-      const delivered = copilot.prompt ?? copilot.user_prompt ?? copilot.message ?? "";
       const prompt = copilotSkillInvocationLine(delivered, projectDir);
       // A subagent's briefing is the agent speaking (difference #8): no
       // HUMAN_TURN, no kept words, no answer, no typed switch, no human
       // sequence. A different prompt typed while the subagent runs still
-      // counts once the first few seconds after its start have passed.
+      // counts, in VS Code once the first few seconds after its start have
+      // passed. The CLI never sends a brief into the launching chat, so its
+      // launch records name no chat and a prompt there counts at once.
       const brief = checkBriefing(prompt);
       if (brief === "briefing") {
         bindSubagentSession(spentBriefing);
         return 0;
       }
-      const started = justStartedSubagent();
+      const started = briefDueHere === false ? null : justStartedSubagent();
       if (started) {
         // A subagent has just started in this chat and this prompt matched
-        // none of its recorded briefs: the host changed the brief's text, or
+        // none of its recorded briefs: VS Code changed the brief's text, or
         // the record could not be read. It is almost certainly that subagent's
         // brief, so it is not counted. A message the person typed in those few
         // seconds is asked for again.
@@ -2288,18 +2417,18 @@ export async function run(
             : [];
         // Path-shaped tools re-key `path` → `file_path`; the search tools
         // (LS/Glob/Grep) keep their native fields, which the core matcher
-        // reads directly (path/pattern/glob).
+        // reads directly (path/pattern/glob), one check per search root.
         const toolCalls: Array<{
           toolName: string;
           toolInput: Record<string, unknown>;
         }> =
           toolName === "LS" || toolName === "Glob" || toolName === "Grep"
-            ? [{
+            ? (filePaths.length > 0 ? filePaths : [undefined]).map((searchRoot) => ({
                 toolName,
                 toolInput: (() => {
                   const searchInput: Record<string, unknown> = {
                     ...withoutPathFields(ti),
-                    ...(filePaths[0] ? { path: filePaths[0] } : {}),
+                    ...(searchRoot ? { path: searchRoot } : {}),
                   };
                   if (
                     toolName === "Glob" &&
@@ -2311,7 +2440,7 @@ export async function run(
                   }
                   return searchInput;
                 })(),
-              }]
+              }))
             : toolName === "Write" || toolName === "Edit"
               ? mutationTargets.map((target) => ({
                   toolName: target.toolName,
@@ -2516,6 +2645,8 @@ export async function run(
           const parsed = JSON.parse(r.stdout) as Record<string, unknown>;
           const decision = parsed.decision;
           const reason = parsed.reason;
+          // Recorded before the block goes out: Copilot sends it back at once.
+          if (decision === "block" && typeof reason === "string" && reason.trim()) armStopNote(coreSessionId, reason);
           process.stdout.write(`${JSON.stringify({
             ...parsed,
             ...(typeof decision === "string"
@@ -2575,7 +2706,7 @@ export async function run(
         // it names no session, so there is no end to attribute.
         if (prior.session_id && prior.session_id !== "unknown" && prior.session_id !== sessionId) {
           const reason =
-            `inferred — the shared Copilot hook manifest omits unsupported ` +
+            `inferred - the shared Copilot hook manifest omits unsupported ` +
             `SessionEnd; reconciled at next ` +
             `SessionStart. Prior session ${prior.session_id} last seen ${prior.ts ?? "unknown"}.`;
           runCore("aidlc-session-end.ts", JSON.stringify({ reason, session_id: prior.session_id }));

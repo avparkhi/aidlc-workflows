@@ -88,6 +88,7 @@ import {
 } from "../../core/tools/aidlc-release.ts";
 import {
   executePlan,
+  TransactionBusyError,
   transactionSourceHash,
   transactionState,
   writeOperation,
@@ -555,7 +556,7 @@ describe("t243 archive and transaction safety", () => {
       schemaVersion: 1,
       root,
       operations: [writeOperation("blocked.txt", "no", "absent")],
-    })).toThrow("another AI-DLC mutation holds");
+    })).toThrow(TransactionBusyError);
     expect(existsSync(join(root, "blocked.txt"))).toBe(false);
     expect(existsSync(join(root, ".aidlc-transaction.lock"))).toBe(true);
   });
@@ -615,14 +616,15 @@ describe("t243 archive and transaction safety", () => {
       operations: [writeOperation("blocked.txt", "no", "absent")],
     }, {
       validateCandidates() {
-        rmSync(lockPath);
-        writeFileSync(lockPath, replacement);
+        rmSync(lockPath, { recursive: true });
+        mkdirSync(lockPath);
+        writeFileSync(join(lockPath, "owner.json"), replacement);
         throw new Error("replacement installed");
       },
     })).toThrow("replacement installed");
-    expect(readFileSync(lockPath, "utf-8")).toBe(replacement);
+    expect(readFileSync(join(lockPath, "owner.json"), "utf-8")).toBe(replacement);
     expect(existsSync(join(root, "blocked.txt"))).toBe(false);
-    rmSync(lockPath);
+    rmSync(lockPath, { recursive: true });
   });
 
   test("route mutation policy blocks a plan before it creates destination bytes", () => {
@@ -2710,7 +2712,7 @@ describe("t243 project initialization", () => {
     expect(addCodex.status).toBe(4);
     expect(addCodex.stdout).toContain("predates shared onboarding");
     expect(addCodex.stdout).toContain(
-      "run aidlc config --harness kiro first — if it still refuses afterwards, its AGENTS.md is exclusive and they cannot coexist in one project",
+      "run aidlc config --harness kiro first - if it still refuses afterwards, its AGENTS.md is exclusive and they cannot coexist in one project",
     );
     expect(existsSync(join(project, ".codex"))).toBe(false);
     expect(readFileSync(join(project, "AGENTS.md"), "utf-8")).toBe(agents);
@@ -3032,7 +3034,7 @@ describe("t243 project initialization", () => {
     for (const [version, message] of [
       [
         `${AIDLC_VERSION}-preview.20260101.1`,
-        "predates shared onboarding; run aidlc config --harness copilot first — if it still refuses afterwards, its AGENTS.md is exclusive and they cannot coexist in one project",
+        "predates shared onboarding; run aidlc config --harness copilot first - if it still refuses afterwards, its AGENTS.md is exclusive and they cannot coexist in one project",
       ],
       ["99.0.0-preview.20260101.1", "cannot coexist"],
     ]) {
@@ -4536,8 +4538,10 @@ describe("t243 project initialization", () => {
     expect(merged.startsWith(original)).toBe(true);
     expect(merged.match(/BEGIN AI-DLC:gitignore/g)).toHaveLength(1);
 
-    // Quiet output is one message, and the finding is part of it.
-    const quietProject = temp("aidlc-t243-hidden-records-quiet-");
+    // Quiet output is one message, and the finding is part of it. The folder's
+    // name is short: on Windows a project folder 75 characters deep gets
+    // config's own warning that it is too deep for AI-DLC's records.
+    const quietProject = temp("aidlc-t243-quiet-");
     expect(spawnSync("git", ["init", "-q", quietProject]).status).toBe(0);
     writeFileSync(join(quietProject, ".gitignore"), original);
     for (const flags of [["--dry-run", "--quiet"], ["--quiet"]]) {
@@ -8821,6 +8825,7 @@ describe("t243 projection channel", () => {
           "sha256:724c2e36547e1eab35a3637595cea3f4bf1ddecf75fb798e0e165932c06cd93e",
           "sha256:b0f5e39317a501be8567bbb0ecbdff651116abc28a500b9c451b732ca8f2e088",
           "sha256:b87a3ec2c39cb24074c6fa37f626e9d150d435d18069fbd0c762fdbd70719c5c",
+          "sha256:a885fe6b7137ba16e0c24ce168b30ef5c780fe9991fc2d6bdff10cc15ad83c05",
         ],
       },
     };

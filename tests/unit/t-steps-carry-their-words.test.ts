@@ -36,7 +36,7 @@ import { shellArg } from "../../core/tools/aidlc-lib.ts";
 
 const INVOCATION = "bun .claude/tools/aidlc-orchestrate.ts";
 const LOG = "bun .claude/tools/aidlc-log.ts";
-const OTHER = "**Other** \u2014 describe what you want instead";
+const OTHER = "**Other** - describe what you want instead";
 const HINT = "Reply with a number (or just tell me).";
 
 type Json = Record<string, unknown>;
@@ -244,6 +244,8 @@ function routingAsk(records: boolean): Json {
   };
 }
 
+const REPO_FACTS: Json = { repositories: 12, lines: 1200, minutes_per_repository: { low: 4, high: 7 } };
+
 const ASK_TYPES = [
   "scope-confirm", "compose-offer", "intent-pick", "unit-paused", "project-type", "plan-approval", "guard-recovery",
   "unit-claim", "legacy-plan-approval-recovery",
@@ -254,7 +256,7 @@ const ASK_TYPES = [
 describe("the engine renders every question it asks", () => {
   test("the numbered form is the prompt, the options, Other, and the reply hint, in the routing question's shape", () => {
     expect(numberedProseQuestion("Which?", [{ label: "A", detail: "the first" }, { label: "B" }])).toBe(
-      "Which?\n\n1. **A** \u2014 the first\n2. **B**\n3. " + OTHER + "\n\n" + HINT,
+      "Which?\n\n1. **A** - the first\n2. **B**\n3. " + OTHER + "\n\n" + HINT,
     );
   });
 
@@ -309,13 +311,16 @@ describe("the engine renders every question it asks", () => {
       ["auth", `${INVOCATION} next --claim auth`],
       ["notes", `${INVOCATION} next --claim notes`],
     ]);
-    expect(by("legacy-plan-approval-recovery")).toEqual([["Recover Plan Approval", `${INVOCATION} next`]]);
+    // The recovery question's one choice is the agent's record of the person's yes, then `next`.
+    expect(by("legacy-plan-approval-recovery")).toEqual([
+      ["Recover Plan Approval", `${LOG} answer --stage code-generation --checkpoint plan-approval --details "Recover Plan Approval"`],
+    ]);
     expect(by("compose-offer")).toEqual([
       ["Tailor a plan to this task", `${INVOCATION} next compose --request a1b2c3d4`],
       ["The bugfix plan", `${INVOCATION} next --scope bugfix --request a1b2c3d4`],
       ["The classic plan", `${INVOCATION} next --scope classic --request a1b2c3d4`],
     ]);
-    expect(str(notes(ask("compose-offer")).numbered_prose_question)).toContain("2. **The bugfix plan** \u2014 7 stages");
+    expect(str(notes(ask("compose-offer")).numbered_prose_question)).toContain("2. **The bugfix plan** - 7 stages");
   });
 
   test("the plan question shows each plan's summary and path above the choices", () => {
@@ -328,7 +333,7 @@ describe("the engine renders every question it asks", () => {
   test("a guard question offers its ways on; a terminal one has no options; the agent's own work is no question", () => {
     const shown = notes(ask("guard-recovery"));
     expect((shown.choices as Array<{ label: string }>).map((c) => c.label)).toEqual(["Ask for changes", "Review it again"]);
-    expect(str(shown.numbered_prose_question)).toContain("1. **Ask for changes** \u2014 Say what should change");
+    expect(str(shown.numbered_prose_question)).toContain("1. **Ask for changes** - Say what should change");
     const terminal = notes(ask("guard-recovery", { remedies: [], state_signature: "sig" }));
     expect(terminal.choices).toEqual([]);
     expect(terminal.numbered_prose_question).toBe("The question for the person.");
@@ -490,7 +495,11 @@ describe("a stage step carries its instructions, not the fields to branch on", (
     // Off is said, not left as an absence: a stage file's own declaration ("summary_confirmation: required", a
     // "MANDATORY PRE-GENERATION STOP when enabled") otherwise reads as the ask (seen live on Kiro CLI, twice in one run).
     const off = str(notes(runStage()).ceremony_note);
-    expect(off.startsWith("Summary confirmation is off for this work:")).toBe(true);
+    // The step alone, naming no setting: the agent reads it aloud to people who never chose one.
+    // Said for a stage that asks questions only: a stage that asks none (a first scan) is not told it has answers.
+    expect(off.startsWith("If this stage puts questions to the person, write the stage's outputs once their answers")).toBe(true);
+    expect(off).not.toContain("is off");
+    expect(off).not.toMatch(/summary confirmation/i);
     expect(off).toContain("skip the stage file's Consolidated Summary step and record nothing for it");
     expect(off).not.toContain("confirm the summary");
     expect(notes({ ...on, gate_only: true }).ceremony_note).toBeUndefined();
@@ -514,6 +523,9 @@ describe("a stage step carries its instructions, not the fields to branch on", (
       notes(runStage()),
       ...ASK_TYPES.map((type) => notes(ask(type))),
       notes(routingAsk(true)),
+      // What reading many repositories takes, with the question and on the step.
+      notes(ask("project-type", { ask_type: "repo-scope", repo_facts: REPO_FACTS })),
+      notes(runStage({ stage: "reverse-engineering", repo_facts: REPO_FACTS })),
     ];
     const leaks: string[] = [];
     for (const step of steps) {

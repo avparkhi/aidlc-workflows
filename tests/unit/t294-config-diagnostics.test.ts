@@ -809,6 +809,32 @@ describe("t294 runtime diagnostics", () => {
     }));
   });
 
+  // The adapter's object entry points ({ id, setup, server }) need opencode
+  // 1.18.29; an older opencode 1 no longer loads it, so doctor says so instead
+  // of staying green while no turn of the person's is recorded.
+  test("opencode below 1.18.29 is named with the upgrade; 1.18.29 and OpenCode 2 pass", () => {
+    const opencodeAt = (stdout: string) => ({
+      interactivePath: "/usr/local/bin",
+      which: () => "/usr/local/bin/opencode",
+      run: () => ({ status: 0, stdout }),
+    });
+    expect(probeHarnessCli("opencode", opencodeAt("1.18.20\n"))).toEqual(expect.objectContaining({
+      command: "opencode",
+      required: true,
+      status: "too-old",
+      version: "1.18.20",
+      minimumVersion: "1.18.29",
+      remediation: "Install or upgrade opencode to 1.18.29 or later; OpenCode 2 works too.",
+    }));
+    // opencode 1 prints the bare number; OpenCode 2.2.1 prints "opencode v2.2.1".
+    for (const version of ["1.18.29", "opencode v2.2.1"]) {
+      expect(probeHarnessCli("opencode", opencodeAt(`${version}\n`)), version).toEqual(expect.objectContaining({
+        status: "found",
+        version,
+      }));
+    }
+  });
+
   // A `copilot` whose --version reply has no version number, like the line
   // VS Code's stand-in prints when the real CLI is missing (#1411).
   const NO_VERSION = {
@@ -3966,7 +3992,9 @@ describe("t294 config diagnostics CLI", () => {
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
   test("first Codex install keeps a project's own config.toml and adds AI-DLC's settings", () => {
-    const project = temp("aidlc-t294-codex-own-config-");
+    // A short name: on Windows a project folder 75 characters deep gets
+    // config's own warning that it is too deep for AI-DLC's records.
+    const project = temp("aidlc-t294-own-config-");
     mkdirSync(join(project, ".git"));
     mkdirSync(join(project, ".codex"));
     const own = "# team codex settings\nmodel = \"team-model\"\n\n" +
@@ -4006,7 +4034,9 @@ describe("t294 config diagnostics CLI", () => {
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
   test("first Codex install keeps a project's own output budget and says so once", () => {
-    const project = temp("aidlc-t294-codex-own-budget-");
+    // A short name: on Windows a project folder 75 characters deep gets
+    // config's own warning that it is too deep for AI-DLC's records.
+    const project = temp("aidlc-t294-own-budget-");
     mkdirSync(join(project, ".git"));
     mkdirSync(join(project, ".codex"));
     const own = "model = \"team-model\"\ntool_output_token_limit = 40000\n";

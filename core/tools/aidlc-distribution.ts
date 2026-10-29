@@ -656,6 +656,30 @@ export function managedBlockMarkers(
       };
 }
 
+// A shared file's marked part and the person's part around it, line endings
+// and the blank lines beside the markers aside; `block` is null for a file
+// with no marked part, and the whole is null when its markers are broken.
+export function markedPart(path: string, text: string, marker: string): { block: string | null; person: string } | null {
+  const { begin, end } = managedBlockMarkers(path, marker);
+  const begins = text.split(begin).length - 1;
+  const ends = text.split(end).length - 1;
+  const plain = (part: string): string => part.replace(/\r\n/g, "\n").trim();
+  if (begins === 0 && ends === 0) return { block: null, person: plain(text) };
+  const at = text.indexOf(begin);
+  const to = text.indexOf(end);
+  if (begins !== 1 || ends !== 1 || to < at) return null;
+  const person = [plain(text.slice(0, at)), plain(text.slice(to + end.length))].filter(Boolean).join("\n");
+  return { block: text.slice(at, to + end.length), person };
+}
+
+// Whether `text` differs from `before` (git's copy of the file, empty when it
+// has none) only in AI-DLC's marked part: it has the part, and the person's
+// part around it is as it was.
+export function onlyMarkedPartChanged(path: string, text: string, before: string, marker: string): boolean {
+  const now = markedPart(path, text, marker);
+  return now?.block != null && markedPart(path, before, marker)?.person === now.person;
+}
+
 // One harness's shipped .gitignore lines combined with each sibling's: the
 // first (by name) is the base, and each other adds only the entries not seen,
 // so the part keeps its one comment line.
@@ -872,6 +896,15 @@ export function sha256Matching(value: string | Buffer, known: readonly (string |
     if (known.includes(hash)) return hash;
   }
   return own;
+}
+
+// Whether a file, or AI-DLC's marked part of one, holds what config recorded
+// writing for it: line endings aside, or with include lines a space switch
+// pointed at another space put back. Doctor's changed-files rows and the
+// build's brought-files line both ask it.
+export function holdsRecordedWrite(content: string | Buffer, hash: string): boolean {
+  const text = typeof content === "string" ? content : content.toString("utf-8");
+  return sha256Matching(content, [hash]) === hash || sha256Matching(withSpace(text, "default"), [hash]) === hash;
 }
 
 export function sha256FileMatching(path: string, known: readonly (string | undefined)[]): string {
@@ -1280,6 +1313,16 @@ function jsoncNodeValue(text: string, node: JsoncNode): unknown {
   }
 }
 
+/**
+ * The value of a text that is exactly one JSONC value, comments and whitespace
+ * around it allowed; undefined otherwise. Bun.JSONC.parse alone stops at the
+ * first complete value and drops anything after it.
+ */
+export function jsoncDocumentValue(text: string): unknown {
+  const node = jsoncTree(text);
+  return node ? jsoncNodeValue(text, node) : undefined;
+}
+
 function plainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -1353,6 +1396,14 @@ function insertJsoncEntry(
   const last = entries[entries.length - 1];
   if (last && last.end === last.valueEnd) next = `${next.slice(0, last.valueEnd)},${next.slice(last.valueEnd)}`;
   return next;
+}
+
+/** `value` after the last item of the root object's `key` array, in the layout around it; null when there is no such array. */
+export function appendJsoncArrayItem(text: string, key: string, value: unknown): string | null {
+  const root = jsoncTree(text);
+  const array = root?.kind === "object" ? root.members.findLast((member) => member.key === key)?.node : undefined;
+  if (!root || array?.kind !== "array") return null;
+  return insertJsoncEntry(text, jsonLayout(text, root), array, false, undefined, value, false);
 }
 
 function replaceJsoncNode(text: string, layout: JsonLayout, node: JsoncNode, value: unknown): string {

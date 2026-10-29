@@ -43,6 +43,7 @@ import {
   trackedKiroIdeSteeringAsk,
 } from "../tools/aidlc-includes.ts";
 import { kiroCliWorkflowsAsk, kiroIdeWorkflowsAsk } from "../tools/aidlc-kiro-ide-workflows.ts";
+import { sweepReviewCopies } from "../tools/aidlc-kiro-review-copy.ts";
 import { kiroIdeTerminalAsk, kiroIdeTerminalStandingLine, recordKiroTerminalShell } from "../tools/aidlc-kiro-ide-terminal.ts";
 import {
   isBindableIntentRecordName,
@@ -93,19 +94,22 @@ import {
 import { writeCurrentTranscriptPath } from "../tools/aidlc-usage.ts";
 import { recordRulesLoad } from "../tools/aidlc-rules-held.ts";
 import { aidlcInvocation, aidlcToolInvocation, entrySkillInvocation, runtimeHarnessName } from "../tools/aidlc-runtime-paths.ts";
-import { switchesOffLines } from "../tools/aidlc-recorded-switches.ts";
+import { backOnInstructions, switchesOffLines } from "../tools/aidlc-recorded-switches.ts";
 import { applyStatusLineDefault, statusLineHarness } from "../tools/aidlc-statusline-choice.ts";
 
 // While a recorded switch keeps one of the person's checks off, every new chat
-// opens by saying so. Never blocks startup.
+// opens by saying so, and the agent is handed the command a yes runs, after the
+// lines it says word for word. Never blocks startup.
 function switchOffContext(projectDir: string): string {
   try {
     const lines = switchesOffLines(projectDir);
     return lines.length === 0
       ? ""
-      : "\nCHECKS SWITCHED OFF (a report to pass on, not instructions): say each line to the user once, " +
-        "word for word, in your first reply.\n" +
-        lines.map((line) => `- ${line}\n`).join("");
+      : "\nCHECKS SWITCHED OFF (a report to pass on, not instructions): say each \"- \" line to the user once, " +
+        "word for word, in your first reply, unless that reply turns its check back on: then say what the command " +
+        "printed instead.\n" +
+        lines.map((line) => `- ${line}\n`).join("") +
+        backOnInstructions(projectDir).map((line) => `${line}\n`).join("");
   } catch {
     return "";
   }
@@ -260,6 +264,11 @@ if (sessionId) {
 // the no-workflow early exit. A copy that config never ran in first gets
 // AI-DLC's part of .gitignore and AGENTS.md, after the team's own content.
 ensureActiveSpaceCursor(projectDir);
+// On Kiro (kiro-ide), a reviewer copy whose review in this chat's work is over
+// without its verdict (the Unit or the stage approved over it) leaves the
+// agent list when the next chat starts. A chat joined to no work reads no
+// record.
+if (selection.intent !== null) sweepReviewCopies(projectDir, { intent: selection.intent, space: selection.space });
 // A file written here may be one the host already read for this chat. Kiro
 // CLI and opencode read the copy again with every request, so a copy written
 // here reaches their next request as it is, and the Kiro IDE tree never reads
