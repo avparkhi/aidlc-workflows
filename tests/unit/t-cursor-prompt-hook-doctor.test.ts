@@ -16,10 +16,10 @@ import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hooksHealthDir, hookLiveness, writeSessionPidEntry } from "../../dist/cursor/.cursor/tools/aidlc-lib.ts";
-import { hostPromptHookChecks } from "../../dist/cursor/.cursor/tools/aidlc-utility.ts";
+import { hostPromptHookChecks } from "../../dist/claude/.claude/tools/aidlc-utility.ts";
 import { createTestProject, seedAuditFile, seedStateFile } from "../harness/fixtures.ts";
 
-setDefaultTimeout(remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS * 4));
+setDefaultTimeout(NATIVE_STARTUP_TIMEOUT_MS * 4);
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const CURSOR_DIST = join(REPO_ROOT, "dist", "cursor", ".cursor");
